@@ -826,17 +826,67 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
-    scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
+    # LR scheduler: constant/linear (legacy) or StageLR pip package (https://github.com/nruaif/stage-lr)
+    # Enable via any of:
+    #   lr_scheduler = "StageLR" + [StageLR] table  or  scheduler_type = "StageLR"
+    #   lr_scheduler = {type="stage", stages=[...], warmup_steps=...}
+    #   [lr_scheduler] type="stage" ...
+    raw_scheduler = config.get('lr_scheduler', config.get('scheduler_type', 'constant'))
+
+    def _is_stage(val):
+        if isinstance(val, dict):
+            t = str(val.get('type', '')).lower().replace('-', '').replace('_', '')
+            return t in ('stage', 'stagelr')
+        if isinstance(val, str):
+            n = val.lower().replace('-', '').replace('_', '')
+            return n in ('stage', 'stagelr')
+        return False
+
+    def _get_stage_cfg():
+        if isinstance(raw_scheduler, dict) and _is_stage(raw_scheduler):
+            return raw_scheduler
+        for key in ('StageLR', 'stage_lr', 'lr_scheduler', 'stage_lr_config', 'StageLRConfig'):
+            cfg = config.get(key)
+            if isinstance(cfg, dict) and ('stages' in cfg or 'type' in cfg):
+                if key == 'lr_scheduler' and isinstance(cfg, str):
+                    continue
+                if 'stages' in cfg or str(cfg.get('type', '')).lower().replace('-', '').replace('_', '') in ('stage', 'stagelr'):
+                    return cfg
+        return None
+
+    if _is_stage(raw_scheduler):
+        stage_cfg = _get_stage_cfg()
+        if not stage_cfg or 'stages' not in stage_cfg:
+            raise ValueError('StageLR requested (lr_scheduler="StageLR") but no stages found. Add [StageLR] with stages=[{type="linear", end_lr=..., percent=...}, ...] or use lr_scheduler={type="stage", stages=[...]}')
+        # dynamic import: pip package stage-lr preferred, fallback to local optimizers/stage_lr.py if user vendored
+        try:
+            from stage_lr import StageLR
+        except ImportError:
+            try:
+                from stage_lr.scheduler import StageLR
+            except ImportError:
+                from optimizers.stage_lr import StageLR  # legacy local copy
+                import warnings
+                warnings.warn("Using local optimizers/stage_lr.py; pip install stage-lr for standalone package: pip install git+https://github.com/nruaif/stage-lr.git")
+        total_iters = stage_cfg.get('total_iters') or stage_cfg.get('total_steps') or (config['epochs'] * steps_per_epoch)
+        warmup_steps = stage_cfg.get('warmup_steps', config.get('warmup_steps', 0))
+        lr_scheduler = StageLR(optimizer, stages=stage_cfg['stages'], total_iters=total_iters, warmup_steps=warmup_steps)
+    elif raw_scheduler == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
+        if config['warmup_steps'] > 0:
+            warmup_steps = config['warmup_steps']
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
+            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    elif raw_scheduler == 'linear':
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
+        if config['warmup_steps'] > 0:
+            warmup_steps = config['warmup_steps']
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
+            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    elif isinstance(raw_scheduler, str):
+        raise NotImplementedError(f'Unknown lr_scheduler: {raw_scheduler} (expected constant, linear, or StageLR)')
     else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+        raise ValueError(f'lr_scheduler must be string or dict with type="stage", got {type(raw_scheduler)}: {raw_scheduler}')
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
