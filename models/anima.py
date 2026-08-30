@@ -21,15 +21,17 @@ from models.anima_modeling import Anima
 from models.cosmos_predict2 import get_dit_config, time_shift, get_lin_function, WanVAE, vae_encode
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
+from utils import caption_processing as capproc
 
 
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer', 'llm_adapter']
 
-# Minimum number of tags that must survive dropout
-MIN_SURVIVING_TAGS = 3
-
-# Default weights for mixed caption mode
-DEFAULT_MIXED_WEIGHTS = {'tags': 50, 'nl': 10, 'tags_nl': 20, 'nl_tags': 20}
+# Note: MIN_SURVIVING_TAGS / DEFAULT_MIXED_WEIGHTS now live in
+# utils/caption_processing.py — the actual caption pipeline (below) delegates
+# there via `capproc`. Kept here only in case other code in this file or a
+# downstream fork still imports these two names from models.anima.
+MIN_SURVIVING_TAGS = capproc.MIN_SURVIVING_TAGS
+DEFAULT_MIXED_WEIGHTS = capproc.DEFAULT_MIXED_WEIGHTS
 
 
 # ---------------------------------------------------------------------------
@@ -70,321 +72,9 @@ def _scipy_assignment(cost: torch.Tensor):
 
 
 def _load_protected_tags(filepath):
-    """
-    Load protected tags from file.
-
-    Args:
-        filepath: Path to protected_tags.txt (one tag per line)
-
-    Returns:
-        Set of protected tag strings
-    """
-    if not filepath:
-        return set()
-
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            tags = set()
-            for line in f:
-                tag = line.strip()
-                if tag and not tag.startswith('#'):  # Allow comments
-                    tags.add(tag)
-            return tags
-    except FileNotFoundError:
-        print(f"Warning: protected_tags_file not found: {filepath}")
-        return set()
-    except Exception as e:
-        print(f"Warning: Error loading protected_tags_file: {e}")
-        return set()
-
-
-def _apply_tag_dropout(tags, dropout_percent, protected_indices, protected_tags):
-    """
-    Drop a percentage of tags, respecting protections.
-
-    Args:
-        tags: List of tag strings
-        dropout_percent: Fraction of tags to drop (0.0 to 1.0)
-        protected_indices: Indices protected by keep_first_n
-        protected_tags: Tag strings protected by protected_tags_file
-
-    Returns:
-        (surviving_tags, dropped_tags) tuple
-    """
-    if dropout_percent <= 0 or len(tags) == 0:
-        return tags, []
-
-    # Identify which tags can be dropped
-    droppable_indices = []
-    for i, tag in enumerate(tags):
-        if i in protected_indices:
-            continue
-        if tag.strip() in protected_tags:
-            continue
-        droppable_indices.append(i)
-
-    if len(droppable_indices) == 0:
-        return tags, []
-
-    # Calculate how many to drop (use round for unbiased rounding)
-    num_to_drop = round(len(droppable_indices) * dropout_percent)
-
-    # Ensure minimum survivors
-    max_droppable = len(tags) - MIN_SURVIVING_TAGS
-    num_to_drop = min(num_to_drop, max(0, max_droppable))
-
-    if num_to_drop == 0:
-        return tags, []
-
-    # Randomly select indices to drop
-    drop_indices = set(random.sample(droppable_indices, num_to_drop))
-
-    surviving = []
-    dropped = []
-    for i, tag in enumerate(tags):
-        if i in drop_indices:
-            dropped.append(tag)
-        else:
-            surviving.append(tag)
-
-    return surviving, dropped
-
-
-def _process_nl_caption(nl_caption, shuffle_sentences, keep_first_sentence):
-    """
-    Process NL caption with optional sentence shuffling.
-
-    Args:
-        nl_caption: Raw NL caption string
-        shuffle_sentences: Whether to shuffle sentences
-        keep_first_sentence: Keep first sentence in place when shuffling
-
-    Returns:
-        Processed NL caption string
-    """
-    if not shuffle_sentences or not nl_caption:
-        return nl_caption
-
-    # Split by ". " (period + space)
-    # Handle edge cases: trailing period, multiple spaces
-    sentences = []
-    for s in nl_caption.split('. '):
-        s = s.strip()
-        if s:
-            sentences.append(s)
-
-    if len(sentences) <= 1:
-        return nl_caption
-
-    if keep_first_sentence:
-        first = sentences[0]
-        rest = sentences[1:]
-        random.shuffle(rest)
-        sentences = [first] + rest
-    else:
-        random.shuffle(sentences)
-
-    # Rejoin, ensuring proper period spacing
-    result = '. '.join(s.rstrip('.') for s in sentences)
-    if not result.endswith('.'):
-        result += '.'
-
-    return result
-
-
-def _select_variant(caption_mode, mixed_weights, has_nl_caption):
-    """
-    Select which caption variant to use for this sample.
-
-    Args:
-        caption_mode: "tags", "nl", or "mixed"
-        mixed_weights: Weight dict for mixed mode
-        has_nl_caption: Whether NL caption is available
-
-    Returns:
-        Variant string: "tags", "nl", "tags_nl", or "nl_tags"
-    """
-    if caption_mode == "tags":
-        return "tags"
-    elif caption_mode == "nl":
-        if has_nl_caption:
-            return "nl"
-        else:
-            # Warn user about fallback (rate-limited to avoid console spam)
-            if not hasattr(_select_variant, '_nl_fallback_count'):
-                _select_variant._nl_fallback_count = 0
-            _select_variant._nl_fallback_count += 1
-            if _select_variant._nl_fallback_count <= 5:
-                print(f"Warning: caption_mode='nl' but no *_nl.txt found for sample, "
-                      f"falling back to tags (warning {_select_variant._nl_fallback_count}/5)")
-            elif _select_variant._nl_fallback_count == 6:
-                print("Warning: Suppressing further NL fallback warnings. "
-                      "Check that your NL caption files have the '_nl.txt' suffix.")
-            return "tags"
-    elif caption_mode == "mixed":
-        # Build available variants with weights
-        available = {"tags": mixed_weights.get("tags", 50)}
-        if has_nl_caption:
-            available["nl"] = mixed_weights.get("nl", 10)
-            available["tags_nl"] = mixed_weights.get("tags_nl", 20)
-            available["nl_tags"] = mixed_weights.get("nl_tags", 20)
-
-        # Normalize and select
-        total = sum(available.values())
-        if total == 0:
-            return "tags"
-
-        r = random.random() * total
-        cumulative = 0
-        for variant, weight in available.items():
-            cumulative += weight
-            if r < cumulative:
-                return variant
-
-        # Fallback should never execute with correct math, but guard against
-        # floating-point edge cases by returning last variant instead of biasing to tags
-        return variant
-    else:
-        return "tags"  # Unknown mode fallback
-
-
-def _construct_caption(variant, processed_tags, processed_nl):
-    """
-    Construct final caption string based on selected variant.
-
-    Handles empty strings gracefully to avoid malformed captions like ". text"
-    or "text. " when one component is empty.
-
-    Args:
-        variant: "tags", "nl", "tags_nl", or "nl_tags"
-        processed_tags: Processed tag string (may be empty)
-        processed_nl: Processed NL caption string (may be empty)
-
-    Returns:
-        Final caption string
-    """
-    # Normalize empty/whitespace-only strings to empty
-    tags = processed_tags.strip() if processed_tags else ""
-    nl = processed_nl.strip() if processed_nl else ""
-
-    if variant == "tags":
-        return tags if tags else nl  # Fallback to NL if tags empty
-    elif variant == "nl":
-        return nl if nl else tags  # Fallback to tags if NL empty
-    elif variant == "tags_nl":
-        if tags and nl:
-            return f"{tags}. {nl}"
-        return tags or nl  # Return whichever is non-empty
-    elif variant == "nl_tags":
-        if tags and nl:
-            return f"{nl}. {tags}"
-        return nl or tags  # Return whichever is non-empty
-    else:
-        return tags or nl  # Fallback: return any non-empty component
-
-
-def _load_nl_caption(image_spec):
-    """
-    Load NL caption from {basename}_nl.txt file.
-
-    Args:
-        image_spec: Tuple of (tar_file, image_path)
-
-    Returns:
-        NL caption string or None if not found
-    """
-    tar_file, image_path = image_spec
-    if tar_file is not None:
-        # Tar files not supported for NL captions yet
-        return None
-
-    image_path = Path(image_path)
-    nl_path = image_path.parent / f"{image_path.stem}_nl.txt"
-
-    if not nl_path.exists():
-        return None
-
-    try:
-        with open(nl_path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            return content if content else None
-    except Exception:
-        return None
-
-
-def _should_debug_sample(sample_idx, interval):
-    """Determine if we should print debug info for this sample."""
-    if interval == 0:
-        return True  # Every sample
-    elif interval == -1:
-        return sample_idx < 10  # First 10 only
-    else:
-        return sample_idx % interval == 0
-
-
-def _print_debug(sample_idx, info, full_dropout):
-    """Print debug information for a sample."""
-    print(f"\n[Caption Debug | Sample {sample_idx}]")
-
-    if full_dropout:
-        print(f"├─ Full caption dropout: YES (CFG training)")
-        print(f"├─ Final caption: \"\"")
-        print(f"└─ (all other processing skipped)")
-        return
-
-    print(f"├─ Original tags: \"{info.get('original_tags', '')}\"")
-
-    nl = info.get('original_nl')
-    if nl:
-        # Truncate long NL captions for display
-        display_nl = nl[:100] + "..." if len(nl) > 100 else nl
-        print(f"├─ Original NL: \"{display_nl}\"")
-    else:
-        print(f"├─ Original NL: (none)")
-
-    if info.get('protected_indices'):
-        print(f"├─ Protected indices (keep_first_n): {info['protected_indices']}")
-
-    if info.get('protected_tags_matched'):
-        print(f"├─ Protected tags (from file): {info['protected_tags_matched']}")
-
-    dropped = info.get('dropped_tags', [])
-    if dropped:
-        print(f"├─ Dropped tags: {dropped}")
-
-    print(f"├─ Surviving tags: \"{info.get('surviving_tags', '')}\"")
-
-    if info.get('nl_shuffled') and info.get('nl_shuffled') != info.get('original_nl'):
-        display_nl = info['nl_shuffled'][:100] + "..." if len(info['nl_shuffled']) > 100 else info['nl_shuffled']
-        print(f"├─ NL shuffled: \"{display_nl}\"")
-
-    print(f"├─ Variant selected: {info.get('variant', 'unknown')}")
-
-    final = info.get('final_caption', '')
-    display_final = final[:150] + "..." if len(final) > 150 else final
-    print(f"├─ Final caption: \"{display_final}\"")
-    print(f"└─ Full caption dropout: No")
-
-
-def _log_caption_stats(debug_state, step, interval=1000):
-    """Log caption processing statistics periodically."""
-    if step % interval != 0 or step == 0:
-        return
-
-    variants = ['tags', 'nl', 'tags_nl', 'nl_tags']
-    variant_counts = [debug_state.get(f'variant_{v}', 0) for v in variants]
-    total = sum(variant_counts)
-
-    if total == 0:
-        return
-
-    percentages = [f"{v}={c}({100*c//total}%)" for v, c in zip(variants, variant_counts)]
-
-    tag_dropout = debug_state.get('tag_dropout_count', 0)
-    full_dropout = debug_state.get('full_dropout_count', 0)
-
-    print(f"Step {step} | Variants: {', '.join(percentages)} | "
-          f"Tag drops: {tag_dropout} | CFG drops: {full_dropout}")
+    """Load protected tags from file (one tag per line). Delegates to the
+    shared implementation in utils.caption_processing."""
+    return capproc.load_protected_tags(filepath)
 
 
 def _process_caption_full(
@@ -395,127 +85,19 @@ def _process_caption_full(
     sample_idx,
     debug_state
 ):
+    """Full caption processing pipeline. Delegates to the shared
+    implementation in utils.caption_processing so anima.py and mage_flow.py
+    can't silently drift out of sync (this includes attribution handling:
+    caption_mode='mixed' variants, tag/NL dropout, shuffle, and the
+    "Drawn by X" attribution position/immunity/dedupe-on-combine policy).
     """
-    Full caption processing pipeline.
+    return capproc.process_caption(tags_str, image_spec, config, protected_tags, sample_idx, debug_state)
 
-    Args:
-        tags_str: Raw tags string from caption file
-        image_spec: Tuple of (tar_file, image_path) for loading NL caption
-        config: Dict with caption processing config options
-        protected_tags: Set of protected tag strings
-        sample_idx: Current sample index (for debug logging)
-        debug_state: Mutable dict for tracking stats
 
-    Returns:
-        Final caption string for training
-    """
-    debug_info = {}
-    debug_enabled = config.get('debug_caption_processing', False)
-    debug_interval = config.get('debug_caption_interval', 100)
-
-    should_debug = debug_enabled and _should_debug_sample(sample_idx, debug_interval)
-
-    # Step 1: Full caption dropout (CFG training)
-    caption_dropout = config.get('caption_dropout_percent', 0.0)
-    if caption_dropout > 0 and random.random() < caption_dropout:
-        debug_state['full_dropout_count'] = debug_state.get('full_dropout_count', 0) + 1
-        if should_debug:
-            _print_debug(sample_idx, debug_info, full_dropout=True)
-        return ""
-
-    if should_debug:
-        debug_info['original_tags'] = tags_str
-
-    # Step 2: Load NL caption if needed
-    caption_mode = config.get('caption_mode', 'tags')
-    nl_caption = None
-    if caption_mode in ['nl', 'mixed']:
-        nl_caption = _load_nl_caption(image_spec)
-
-    if should_debug:
-        debug_info['original_nl'] = nl_caption
-
-    # Step 3: Parse and process tags
-    delimiter = config.get('tag_delimiter', ', ')
-    tags = [t.strip() for t in tags_str.split(delimiter) if t.strip()]
-
-    # Shuffle tags
-    if config.get('shuffle_tags', False):
-        keep_first_n = config.get('shuffle_keep_first_n', 0)
-        if keep_first_n > 0 and keep_first_n < len(tags):
-            prefix = tags[:keep_first_n]
-            suffix = tags[keep_first_n:]
-            random.shuffle(suffix)
-            tags = prefix + suffix
-        else:
-            random.shuffle(tags)
-
-    # Apply tag dropout
-    dropout_percent = config.get('tag_dropout_percent', 0.0)
-    keep_first_n = config.get('shuffle_keep_first_n', 0)
-    protected_indices = set(range(min(keep_first_n, len(tags))))
-
-    dropped_tags = []
-    if dropout_percent > 0:
-        tags, dropped_tags = _apply_tag_dropout(
-            tags, dropout_percent, protected_indices, protected_tags
-        )
-        debug_state['tag_dropout_count'] = debug_state.get('tag_dropout_count', 0) + len(dropped_tags)
-
-    processed_tags = delimiter.join(tags)
-
-    if should_debug:
-        debug_info['protected_indices'] = protected_indices if protected_indices else None
-        debug_info['protected_tags_matched'] = [t for t in tags if t in protected_tags]
-        debug_info['dropped_tags'] = dropped_tags
-        debug_info['surviving_tags'] = processed_tags
-
-    # Step 4: Process NL caption
-    has_nl = nl_caption is not None and len(nl_caption.strip()) > 0
-    processed_nl = ""
-
-    if has_nl:
-        processed_nl = _process_nl_caption(
-            nl_caption,
-            config.get('nl_shuffle_sentences', False),
-            config.get('nl_keep_first_sentence', False)
-        )
-        if should_debug:
-            debug_info['nl_shuffled'] = processed_nl
-
-    # Step 5: Select variant
-    mixed_weights = config.get('mixed_weights', DEFAULT_MIXED_WEIGHTS)
-    variant = _select_variant(caption_mode, mixed_weights, has_nl)
-
-    # Track variant distribution
-    variant_key = f'variant_{variant}'
-    debug_state[variant_key] = debug_state.get(variant_key, 0) + 1
-
-    if should_debug:
-        debug_info['variant'] = variant
-
-    # Step 6: Construct final caption
-    final_caption = _construct_caption(variant, processed_tags, processed_nl)
-
-    # Step 7: Validate final caption is not empty
-    if not final_caption or not final_caption.strip():
-        # Both tags and NL were empty - fall back to original caption
-        if not hasattr(_process_caption_full, '_empty_caption_count'):
-            _process_caption_full._empty_caption_count = 0
-        _process_caption_full._empty_caption_count += 1
-        if _process_caption_full._empty_caption_count <= 5:
-            print(f"Warning: Caption processing produced empty result for sample {sample_idx}, "
-                  f"using original caption (warning {_process_caption_full._empty_caption_count}/5)")
-        elif _process_caption_full._empty_caption_count == 6:
-            print("Warning: Suppressing further empty caption warnings. "
-                  "Check your caption files for empty or whitespace-only content.")
-        final_caption = tags_str  # Use original caption as fallback
-
-    if should_debug:
-        debug_info['final_caption'] = final_caption
-        _print_debug(sample_idx, debug_info, full_dropout=False)
-
-    return final_caption
+def _log_caption_stats(debug_state, step, interval=1000):
+    """Log caption processing statistics periodically. Delegates to the
+    shared implementation in utils.caption_processing."""
+    return capproc.log_caption_stats(debug_state, step, interval)
 
 
 def _shuffle_tags(caption, delimiter=', ', keep_first_n=0):
@@ -629,29 +211,12 @@ class AnimaPipeline(BasePipeline):
         self.train_mlp = self.model_config.get('train_mlp', True)
 
         # === Caption Processing Config ===
-        # Build a config dict for caption processing
-        self.caption_config = {
-            # Tag processing
-            'shuffle_tags': self.model_config.get('shuffle_tags', False),
-            'tag_delimiter': self.model_config.get('tag_delimiter', ', '),
-            'shuffle_keep_first_n': self.model_config.get('shuffle_keep_first_n', 0),
-            'tag_dropout_percent': self.model_config.get('tag_dropout_percent', 0.0),
-
-            # NL caption processing
-            'nl_shuffle_sentences': self.model_config.get('nl_shuffle_sentences', False),
-            'nl_keep_first_sentence': self.model_config.get('nl_keep_first_sentence', False),
-
-            # Caption dropout (CFG training)
-            'caption_dropout_percent': self.model_config.get('caption_dropout_percent', 0.0),
-
-            # Mode selection
-            'caption_mode': self.model_config.get('caption_mode', 'tags'),
-            'mixed_weights': self.model_config.get('mixed_weights', DEFAULT_MIXED_WEIGHTS),
-
-            # Debug
-            'debug_caption_processing': self.model_config.get('debug_caption_processing', False),
-            'debug_caption_interval': self.model_config.get('debug_caption_interval', 100),
-        }
+        # Build a config dict for caption processing, delegated in full to
+        # utils.caption_processing (build_caption_config) so this stays in
+        # sync with mage_flow.py's caption pipeline, including attribution
+        # handling (attribution_position / attribution_dropout_immune /
+        # attribution_dedupe_on_combine / attribution_patterns).
+        self.caption_config = capproc.build_caption_config(self.model_config)
 
         # Load protected tags
         protected_tags_file = self.model_config.get('protected_tags_file', None)
@@ -746,25 +311,9 @@ class AnimaPipeline(BasePipeline):
         self.qwen_model.requires_grad_(False)
 
     def _validate_caption_config(self):
-        """Validate caption-related config options."""
-        config = self.caption_config
-
-        caption_mode = config.get('caption_mode', 'tags')
-        valid_modes = ['tags', 'nl', 'mixed']
-        if caption_mode not in valid_modes:
-            raise ValueError(f"caption_mode must be one of {valid_modes}, got '{caption_mode}'")
-
-        dropout = config.get('tag_dropout_percent', 0.0)
-        if not 0.0 <= dropout <= 1.0:
-            raise ValueError(f"tag_dropout_percent must be between 0.0 and 1.0, got {dropout}")
-
-        caption_dropout = config.get('caption_dropout_percent', 0.0)
-        if not 0.0 <= caption_dropout <= 1.0:
-            raise ValueError(f"caption_dropout_percent must be between 0.0 and 1.0, got {caption_dropout}")
-
-        if caption_mode in ['nl', 'mixed']:
-            print(f"Note: caption_mode='{caption_mode}' expects {{name}}_nl.txt files. "
-                  "Samples without NL captions will fall back to tags.")
+        """Validate caption-related config options. Delegates to the shared
+        implementation in utils.caption_processing."""
+        capproc.validate_caption_config(self.caption_config)
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
