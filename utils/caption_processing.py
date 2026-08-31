@@ -347,13 +347,15 @@ def _print_debug(sample_idx, info, full_dropout):
         return
     print(f"├─ Original tags: \"{info.get('original_tags', '')}\"")
     nl = info.get('original_nl')
-    print(f"├─ Original NL: \"{(nl[:100] + '...') if nl and len(nl) > 100 else (nl or '(none)')}\"")
+    print(f"├─ Original NL: \"{nl or '(none)'}\"")
     if info.get('dropped_tags'):
         print(f"├─ Dropped tags: {info['dropped_tags']}")
     print(f"├─ Surviving tags: \"{info.get('surviving_tags', '')}\"")
+    if info.get('processed_nl'):
+        print(f"├─ Processed NL (post shuffle/attribution): \"{info['processed_nl']}\"")
     print(f"├─ Variant selected: {info.get('variant', 'unknown')}")
     final = info.get('final_caption', '')
-    print(f"└─ Final caption: \"{(final[:150] + '...') if len(final) > 150 else final}\"")
+    print(f"└─ Final caption: \"{final}\"")
 
 
 def log_caption_stats(debug_state, step, interval=1000):
@@ -452,6 +454,9 @@ def process_caption(tags_str, image_spec, config, protected_tags, sample_idx, de
         processed_nl = '. '.join(s.rstrip('.') for s in sentences)
         if processed_nl and not processed_nl.endswith('.'):
             processed_nl += '.'
+
+    if should_debug:
+        debug_info['processed_nl'] = processed_nl
 
     # Step 5: pick a variant and construct.
     mixed_weights = config.get('mixed_weights', DEFAULT_MIXED_WEIGHTS)
