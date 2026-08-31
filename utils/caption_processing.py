@@ -305,9 +305,13 @@ def _construct_caption(variant, processed_tags, processed_nl, attribution_patter
     if variant == "nl":
         return nl if nl else tags
     if variant == "tags_nl":
-        return f"{tags}. {nl}" if (tags and nl) else (tags or nl)
+        if tags and nl:
+            return f"{tags.rstrip('.,;: ')}. {nl}"
+        return tags or nl
     if variant == "nl_tags":
-        return f"{nl}. {tags}" if (tags and nl) else (nl or tags)
+        if tags and nl:
+            return f"{nl.rstrip('.,;: ')}. {tags}"
+        return nl or tags
     return tags or nl
 
 
