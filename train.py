@@ -43,6 +43,7 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils import validation_sampling
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -518,6 +519,43 @@ if __name__ == '__main__':
         dist.barrier()
         quit()
 
+    # Validation sampling setup must happen BEFORE dataset_manager.cache(),
+    # which frees submodels to the 'meta' device. Sampling needs the VAE at
+    # every round to decode latents, and (in cache_text_embeddings mode) needs
+    # the text encoder to embed the sample prompts at least once.
+    sampling_config = validation_sampling.build_sampling_config(config)
+    if sampling_config is not None:
+        if config.get('pipeline_stages', 1) > 1:
+            # to_layers() is partitioned across stages, so no single rank holds
+            # the whole model, and generation needs the full stack. Rather than
+            # crash mid-run, disable and say so clearly.
+            if is_main_process():
+                print('Warning: validation sampling requires pipeline_stages = 1 '
+                      f"(got {config['pipeline_stages']}); sampling is disabled for this run.")
+            sampling_config = None
+        else:
+            model.keep_vae_resident = True
+            adapter = model.get_sampling_adapter()
+            if adapter is None:
+                if is_main_process():
+                    print(f"Warning: model type '{config['model']['type']}' does not support "
+                          'validation sampling yet; sampling is disabled for this run.')
+                sampling_config = None
+                model.keep_vae_resident = False
+            else:
+                # Encode the fixed prompt set now, while the text encoder is
+                # guaranteed to be loaded. With cache_text_embeddings = true it
+                # is freed by the caching step below; with it false the encoder
+                # stays resident, but pre-encoding is still cheaper than
+                # re-encoding the same prompts every round.
+                prompt_strings = {p['prompt'] for p in sampling_config['prompts']}
+                prompt_strings |= {p['negative_prompt'] for p in sampling_config['prompts']
+                                   if validation_sampling.uses_negative_branch(
+                                       p['cfg'], p['negative_prompt'])}
+                if not adapter.prepare(sorted(prompt_strings)):
+                    sampling_config = None
+                    model.keep_vae_resident = False
+
     dataset_manager.cache()
     if args.cache_only:
         quit()
@@ -936,6 +974,21 @@ if __name__ == '__main__':
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
+    # Sampling round counter, used by the 'walk' seed strategy so each round
+    # advances the seed. Fixed seeds (the default) ignore it.
+    sampling_round = 0
+    if sampling_config is not None and sampling_config['sample_at_first'] and not resume_from_checkpoint:
+        # A pre-training baseline gives the "before" half of every before/after
+        # comparison for free, and surfaces a broken sampling config in the
+        # first minute of a run instead of at the end of epoch 1.
+        if is_main_process():
+            validation_sampling.generate_and_log_samples(
+                model, sampling_config, tb_writer, 0, run_dir, 'step0_baseline',
+                sampling_round, wandb_module=(wandb if wandb_enable else None),
+                disable_block_swap=disable_block_swap_for_eval)
+        sampling_round += 1
+        dist.barrier()
+
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
     epoch_loss = 0
     num_steps = 0
@@ -972,6 +1025,21 @@ if __name__ == '__main__':
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
+
+        # Validation sampling runs on its own cadence, separate from eval:
+        # loss eval is one forward pass, while sampling is a full denoising
+        # loop per prompt, so most runs want it far less often.
+        if validation_sampling.should_sample(sampling_config, step, epoch, finished_epoch):
+            if is_main_process():
+                label = f'epoch{epoch}' if finished_epoch else f'step{step}'
+                validation_sampling.generate_and_log_samples(
+                    model, sampling_config, tb_writer, x_axis, run_dir, label,
+                    sampling_round, wandb_module=(wandb if wandb_enable else None),
+                    disable_block_swap=disable_block_swap_for_eval)
+            sampling_round += 1
+            # Non-main ranks wait so nobody starts the next training step while
+            # rank 0 is still holding the GPU for generation.
+            dist.barrier()
 
         if finished_epoch:
             if is_main_process():

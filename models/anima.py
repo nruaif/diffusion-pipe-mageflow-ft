@@ -22,6 +22,7 @@ from models.cosmos_predict2 import get_dit_config, time_shift, get_lin_function,
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
 from utils import caption_processing as capproc
+from utils import validation_sampling as vsampling
 
 
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer', 'llm_adapter']
@@ -606,6 +607,15 @@ class AnimaPipeline(BasePipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def get_sampling_adapter(self):
+        if getattr(self, '_sampling_adapter', None) is None:
+            self._sampling_adapter = AnimaSamplingAdapter(self)
+        return self._sampling_adapter
+
+    def sampling_dtype(self):
+        # train.py resolves these to real torch.dtype objects via DTYPE_MAP.
+        return self.model_config.get('transformer_dtype') or self.model_config['dtype']
+
     def get_param_groups(self, parameters):
         """
         Separate parameters into groups for per-component learning rates.
@@ -862,3 +872,155 @@ class FinalLayer(nn.Module):
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         net_output_B_C_T_H_W = self.unpatchify(x_B_T_H_W_O)
         return net_output_B_C_T_H_W
+
+
+class AnimaSamplingAdapter(vsampling.SamplingAdapter):
+    """Validation sampling for Anima.
+
+    Latents are 5D [1, 16, 1, H/8, W/8] volumes: Anima uses a Wan-family VAE
+    (z_dim=16, 8x spatial downsample, 3 temporal-downsample stages), and a
+    still image is a single-frame video, so the temporal axis stays at 1.
+
+    Text conditioning is a 4-tuple (qwen_embeds, qwen_mask, t5_ids, t5_mask).
+    Anima's LLMAdapter maps Qwen hidden states into T5 token space, so both the
+    Qwen embeddings and the T5 token ids are needed. All four are precomputed
+    once at startup and reused, which keeps the ~large Qwen encoder out of the
+    per-round cost and works whether or not text embeddings are cached.
+    """
+
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self._cond = {}
+        self._layers = None
+
+    # -- startup ---------------------------------------------------------
+
+    def prepare(self, prompt_strings):
+        qwen = getattr(self.pipeline, 'qwen_model', None)
+        if qwen is None or _is_meta_module(qwen):
+            print('Warning: Anima Qwen text encoder is not loaded; validation sampling disabled.')
+            self.supported = False
+            return False
+
+        missing = [p for p in prompt_strings if p not in self._cond]
+        if not missing:
+            return True
+
+        was_on_cpu = not _module_is_cuda(qwen)
+        try:
+            if was_on_cpu and torch.cuda.is_available():
+                qwen.to('cuda')
+            for prompt in missing:
+                self._encode_and_cache(prompt, qwen)
+        except Exception as e:
+            print(f'Warning: failed to pre-encode sampling prompts ({type(e).__name__}: {e}); '
+                  'validation sampling disabled.')
+            self.supported = False
+            return False
+        finally:
+            if was_on_cpu:
+                qwen.to('cpu')
+        return True
+
+    def _encode_and_cache(self, prompt, qwen):
+        if prompt in self._cond:
+            return self._cond[prompt]
+        qwen_enc = _tokenize_qwen(self.pipeline.qwen_tokenizer, [prompt])
+        qwen_embeds = _compute_qwen_embeddings(qwen, qwen_enc.input_ids, qwen_enc.attention_mask)
+        t5_enc = _tokenize_t5(self.pipeline.t5_tokenizer, [prompt])
+        self._cond[prompt] = tuple(
+            t.detach().to('cpu') for t in (
+                qwen_embeds, qwen_enc.attention_mask, t5_enc.input_ids, t5_enc.attention_mask))
+        return self._cond[prompt]
+
+    # -- SamplingAdapter -------------------------------------------------
+
+    def encode_prompt(self, prompt):
+        if prompt in self._cond:
+            return self._cond[prompt]
+        qwen = getattr(self.pipeline, 'qwen_model', None)
+        if qwen is not None and not _is_meta_module(qwen):
+            return self._encode_and_cache(prompt, qwen)
+        raise RuntimeError(
+            f'prompt was not pre-encoded at startup and the Qwen encoder has been '
+            f'unloaded: {prompt!r}. All sampling prompts must go through prepare().')
+
+    def init_latents(self, width, height, generator, device, dtype):
+        h, w = height // 8, width // 8
+        z_dim = getattr(self.pipeline.vae, 'z_dim', 16)
+        noise = torch.randn(1, z_dim, 1, h, w, generator=generator, dtype=torch.float32)
+        return noise.to(device=device, dtype=torch.float32)
+
+    def predict_velocity(self, latents, text_cond, sigma, width, height):
+        device = latents.device
+        qwen_embeds, qwen_mask, t5_ids, t5_mask = (t.to(device) for t in text_cond)
+        timestep = torch.full((1, 1), float(sigma), device=device, dtype=torch.float32)
+        inputs = (latents.to(self.pipeline.sampling_dtype()), timestep,
+                  qwen_embeds, qwen_mask, t5_ids, t5_mask)
+        out = vsampling.run_layer_stack(self._sampling_layers(), inputs)
+        return out.float()
+
+    def decode(self, latents, width, height):
+        vae = self.pipeline.vae
+        if _is_meta_module(vae.model):
+            raise RuntimeError(
+                'The VAE was freed to the meta device after latent caching, so samples '
+                'cannot be decoded. Validation sampling should have set keep_vae_resident '
+                'before caching; this indicates the flag was not applied.')
+
+        was_on_cpu = not _module_is_cuda(vae.model)
+        try:
+            if was_on_cpu:
+                vae.model.to('cuda')
+            # scale tensors live alongside the weights and must follow them.
+            scale = [vae.mean.to('cuda'), (1.0 / vae.std).to('cuda')]
+            with torch.autocast('cuda', dtype=AUTOCAST_DTYPE):
+                out = vae.model.decode(latents.to('cuda', dtype=vae.dtype), scale)
+        finally:
+            if was_on_cpu:
+                vae.model.to('cpu')
+
+        # [B, C, T, H, W] -> a single frame.
+        out = out.float().clamp(-1, 1)
+        if out.ndim == 5:
+            out = out[:, :, 0]
+        arr = (127.5 * (out.permute(0, 2, 3, 1) + 1.0)).cpu().byte().numpy()
+        from PIL import Image
+        return Image.fromarray(arr[0])
+
+    # -- internals -------------------------------------------------------
+
+    def _sampling_layers(self):
+        """Layer stack forced onto the cached-embeddings path.
+
+        In on-the-fly caption mode `to_layers()` hands InitialLayer a live Qwen
+        model, which makes it treat its first text input as token ids and run
+        the encoder itself. Sampling always supplies precomputed embeddings, so
+        it builds its own stack with qwen_model=None. The wrappers only hold
+        references to the same modules and the same offloader, so weights are
+        shared and block swapping still works.
+        """
+        if self._layers is None:
+            transformer = self.pipeline.transformer
+            layers = [InitialLayer(transformer, None,
+                                   self.pipeline.qwen_tokenizer, self.pipeline.t5_tokenizer)]
+            for i, block in enumerate(transformer.blocks):
+                layers.append(TransformerLayer(block, i, self.pipeline.offloader))
+            layers.append(FinalLayer(transformer))
+            self._layers = layers
+        return self._layers
+
+
+def _is_meta_module(module):
+    """True if a module's weights were freed to the meta device after caching."""
+    try:
+        return any(p.device.type == 'meta' for p in module.parameters())
+    except (StopIteration, AttributeError):
+        return False
+
+
+def _module_is_cuda(module):
+    try:
+        return next(module.parameters()).device.type == 'cuda'
+    except (StopIteration, AttributeError):
+        return False

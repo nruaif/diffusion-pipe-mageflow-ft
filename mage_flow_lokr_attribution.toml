@@ -6,7 +6,7 @@
 
 output_dir = '/path/to/output/mage-flow-lokr-run'
 dataset = '/path/to/configs/mage_flow_dataset.toml'
-
+ 
 # training settings
 epochs = 20
 micro_batch_size_per_gpu = 12
@@ -16,7 +16,7 @@ gradient_clipping = 1
 warmup_steps = 20  # used by StageLR if [StageLR].warmup_steps not set
 # StageLR example (pip install stage-lr): uncomment to use multi-stage schedule instead of constant+warmup
 lr_scheduler = "StageLR"
-
+ 
 # misc settings
 save_every_n_epochs = 1
 # checkpoint_every_n_minutes = 200
@@ -28,7 +28,7 @@ activation_checkpointing = true
 save_dtype = 'bfloat16'
 caching_batch_size = 8
 steps_per_print = 1
-
+ 
 [model]
 type = 'mage_flow'
 diffusers_path = '/path/to/models/Mage-Flow'
@@ -40,7 +40,7 @@ sigmoid_scale = 1.0
 shift = 6.0
 vae_sample_posterior = false
 max_text_tokens = 512
-
+ 
 # --- Text embedding caching vs on-the-fly caption augmentation ---
 # true (default): encode each caption ONCE and cache to disk. Fast, low VRAM,
 #   but the caption augmentation options below have NO effect.
@@ -54,14 +54,14 @@ text_encoder_nf4 = true            # 4-bit bitsandbytes (~quarter TE VRAM, needs
 # ...or point text_encoder_path at an already-quantized Qwen3-VL repo, which
 # loads low-bit directly (no flag needed); only valid if Mage used stock Qwen3-VL:
 # text_encoder_path = '/path/to/Qwen3-VL-bnb-4bit'
-
+ 
 # Tags / natural-language mixing works in BOTH cache modes: variants are encoded
 # once and weighted-selected per step. Expects a '{basename}_nl.txt' beside each
 # image (missing NL falls back to tags). tags_nl/nl_tags are the concatenations
 # of the (processed) tag string and the (processed) NL caption, in that order.
 caption_mode = 'mixed'             # 'tags' | 'nl' | 'mixed'
 mixed_weights = { tags = 25, nl = 25, tags_nl = 25, nl_tags = 25 }
-
+ 
 # Per-step random augmentation below ONLY works with cache_text_embeddings = false
 # (it re-rolls the caption every step, so it can't be cached):
 shuffle_tags = true                 # shuffle comma-separated tags each step
@@ -79,7 +79,7 @@ nl_shuffle_sentences = true         # on-the-fly only
 # nl_keep_first_sentence = true
 debug_caption_processing = true     # print a few processed captions
 # debug_caption_interval = 100
-
+ 
 # --- Attribution handling ("Drawn by {artist}" style trigger entries) ---
 # Applies when caption_mode = 'nl' or 'mixed', and only matters if your raw
 # caption files repeat the same attribution phrase in BOTH the tags list
@@ -112,7 +112,72 @@ attribution_dropout_immune = true
 # same phrase twice in one training caption. Set false to intentionally keep
 # both copies (e.g. as its own reinforcement strategy).
 attribution_dedupe_on_combine = true
-
+ 
+# --- Inference validation sampling ---------------------------------------
+# Generate images from fixed prompts during training and log them to wandb,
+# TensorBoard, and disk, so you can watch the run evolve instead of inferring
+# progress from loss alone. See docs/validation_sampling.md.
+#
+# Requires pipeline_stages = 1 (this config already uses that). Sampling is
+# synchronous: training pauses for the duration of each round.
+[sampling]
+# Cadence. Sampling is far more expensive than loss eval (a full denoising loop
+# per prompt), so it gets its own, usually slower, cadence.
+sample_every_n_epochs = 1
+# sample_every_n_steps = 500     # optional, independent of the epoch cadence
+sample_at_first = true            # baseline before any training, for before/after
+ 
+# Run-level generation defaults. Every one of these can be overridden per
+# prompt in the [[sampling.prompts]] entries below.
+steps = 30
+cfg = 5.0
+# Inference-time flow shift. Deliberately separate from [model].shift, which
+# controls the TRAINING timestep distribution
+shift = 6.0
+width = 1024
+height = 1024
+negative_prompt = ''
+seed = 42
+# renormalize_cfg = true     # rescale guided velocity to the conditional's norm; reduces oversaturation at high cfg
+ 
+# 'fixed' (default) reuses each prompt's seed every round, so identical
+# starting noise makes epoch-over-epoch differences attributable to training
+# rather than to a different noise draw. 'walk' advances the seed each round.
+seed_strategy = 'fixed'
+ 
+# Where samples go. All three are independent and best-effort.
+save_to_disk = true               # <output_dir>/<run>/samples/<label>/*.png is where the images are saved
+log_to_wandb = true
+# log_to_tensorboard = true
+ 
+# Prompts. A bare string inherits every setting above; a table overrides only
+# the keys it names. Keep this list short — cost is roughly
+# prompts x steps x (2 if cfg > 1 else 1) forward passes per round.
+[[sampling.prompts]]
+prompt = 'Drawn by hyatsu, 1girl, solo, long hair, looking at viewer, upper body'
+label = 'trigger_portrait'
+ 
+[[sampling.prompts]]
+prompt = 'Drawn by hyatsu, 1girl, solo, full body, standing, simple background'
+label = 'trigger_fullbody'
+height = 1536                     # taller frame; everything else inherited
+width = 1024
+ 
+[[sampling.prompts]]
+prompt = 'Drawn by hyatsu, scenery, no humans, outdoors, wide shot'
+label = 'shift_probe'
+shift = 3.0                       # probe shift sensitivity on one prompt only
+ 
+# An off-distribution control: if this degrades over training while the trigger
+# prompts improve, the model is overfitting to the dataset rather than learning
+# a style it can apply generally.
+[[sampling.prompts]]
+prompt = '1girl, solo, looking at viewer'
+label = 'no_trigger_control'
+cfg = 1.0                         # no guidance -> half the compute
+steps = 20
+seed = 7
+ 
 [StageLR]
 # total_iters optional — defaults to epochs*steps_per_epoch if omitted
 stages = [
@@ -121,23 +186,23 @@ stages = [
     { type = "rex",      max_val = 1e-4, min_val = 1e-5, percent = 0.3 },
     { type = "constant", lr = 1e-5,      percent = 0.3 },
 ]
-
+ 
 [adapter]
 type = 'lokr'
-rank = 100000       # effectively full-rank
+rank = 100000       # effectively full-rank; see header comment
 alpha = 1
 dtype = 'bfloat16'
 dropout = 0.0
 factor = 1
 full_matrix = true
-
+ 
 [optimizer]
 type = 'adamw_optimi'
 lr = 1e-5
 betas = [0.9, 0.99]
 weight_decay = 0.02
 eps = 1e-8
-
+ 
 # Alternative: any adv_optm optimizer (AdamW_adv, Muon_adv, Prodigy_adv,
 # Lion_adv, Simplified_AdEMAMix, ...) is usable by name, with its features as
 # plain keys. Great for lower-VRAM full finetune:
@@ -150,9 +215,12 @@ eps = 1e-8
 # nnmf_factor = true
 # stochastic_rounding = true
 # gradient_release = true
-
+ 
 [monitoring]
 enable_wandb = false
+# Fill in your own key only if you flip enable_wandb to true. Never commit a
+# real key to source control — use an environment variable or a local,
+# gitignored secrets file instead.
 wandb_api_key = ''
 wandb_tracker_name = ''
 wandb_run_name = 'lokr-test'
