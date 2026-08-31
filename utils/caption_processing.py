@@ -11,6 +11,7 @@ when text embeddings are NOT cached (the model must encode on-the-fly). Call
 """
 
 import random
+import re
 from pathlib import Path
 
 # Minimum number of tags that must survive dropout.
@@ -18,6 +19,10 @@ MIN_SURVIVING_TAGS = 3
 
 # Default sampling weights for caption_mode='mixed'.
 DEFAULT_MIXED_WEIGHTS = {'tags': 50, 'nl': 10, 'tags_nl': 20, 'nl_tags': 20}
+
+# Default pattern(s) used to recognize an "attribution" entry (e.g. a
+# "Drawn by {artist}" tag/sentence) inside a tag list or an NL sentence list.
+DEFAULT_ATTRIBUTION_PATTERNS = [r'^drawn by\s']
 
 
 def build_caption_config(model_config):
@@ -34,6 +39,11 @@ def build_caption_config(model_config):
         'mixed_weights': model_config.get('mixed_weights', DEFAULT_MIXED_WEIGHTS),
         'debug_caption_processing': model_config.get('debug_caption_processing', False),
         'debug_caption_interval': model_config.get('debug_caption_interval', 100),
+        # --- Attribution handling (e.g. "Drawn by {artist}") ---
+        'attribution_patterns': model_config.get('attribution_patterns', DEFAULT_ATTRIBUTION_PATTERNS),
+        'attribution_position': model_config.get('attribution_position', 'fixed'),
+        'attribution_dropout_immune': model_config.get('attribution_dropout_immune', True),
+        'attribution_dedupe_on_combine': model_config.get('attribution_dedupe_on_combine', True),
     }
 
 
@@ -51,6 +61,13 @@ def validate_caption_config(config):
     if caption_mode in ['nl', 'mixed']:
         print(f"Note: caption_mode='{caption_mode}' expects {{name}}_nl.txt files. "
               "Samples without NL captions fall back to tags.")
+    attribution_position = config.get('attribution_position', 'fixed')
+    if attribution_position not in ('fixed', 'random'):
+        raise ValueError(f"attribution_position must be 'fixed' or 'random', got '{attribution_position}'")
+    try:
+        _compile_attribution_patterns(config.get('attribution_patterns'))
+    except re.error as e:
+        raise ValueError(f"Invalid attribution_patterns regex: {e}")
 
 
 def caption_config_needs_on_the_fly(config):
@@ -134,6 +151,101 @@ def _process_nl_caption(nl_caption, shuffle_sentences, keep_first_sentence):
     return result
 
 
+# --- Attribution handling ("Drawn by {artist}" style trigger entries) ---
+#
+# An "attribution" entry is a single tag (in the tags list) or a single
+# sentence (in the NL caption) matching one of `attribution_patterns`, e.g.
+# "Drawn by emily (pure dream)". Because the same phrase is typically present
+# in *both* the tags string and the NL string (so it survives whichever
+# variant training picks), it needs special handling in two places:
+#   1. Per-field: it should optionally be immune to shuffle-driven loss and
+#      tag dropout (it's a trigger word, not decoration), and its position
+#      (pinned to the front vs. free to land anywhere) is a training-strategy
+#      choice, not a fixed rule.
+#   2. At combine time (tags_nl / nl_tags variants): if it's present in both
+#      fields, the non-leading field's copy should usually be dropped so it
+#      isn't repeated twice in one training caption.
+
+def _compile_attribution_patterns(patterns):
+    return [re.compile(p, re.IGNORECASE) for p in (patterns or DEFAULT_ATTRIBUTION_PATTERNS)]
+
+
+def _is_attribution(entry, compiled_patterns):
+    entry = entry.strip()
+    return any(p.search(entry) for p in compiled_patterns)
+
+
+def _extract_attribution(entries, compiled_patterns):
+    """Pull the first entry matching an attribution pattern out of a list.
+
+    Returns (attribution_entry_or_None, remaining_entries). Matches anywhere
+    in the list (not just index 0), so this is safe regardless of where the
+    attribution currently sits in the raw caption file.
+    """
+    for i, entry in enumerate(entries):
+        if _is_attribution(entry, compiled_patterns):
+            return entry, entries[:i] + entries[i + 1:]
+    return None, entries
+
+
+def _reinsert_attribution(entries, attribution, position):
+    """Insert `attribution` into `entries` per `position` ('fixed'|'random')."""
+    if attribution is None:
+        return entries
+    if position == 'random':
+        idx = random.randint(0, len(entries))
+        return entries[:idx] + [attribution] + entries[idx:]
+    return [attribution] + entries  # 'fixed'
+
+
+def _pop_attribution_if_immune(entries, compiled_patterns, immune):
+    """Phase 1 (before shuffle/dropout): remove the attribution entry only if
+    it's meant to be immune, so shuffle/dropout never see it. If not immune,
+    leave it in `entries` untouched so it's treated like any other entry.
+    Returns (held_attribution_or_None, entries_to_process).
+    """
+    if not immune:
+        return None, entries
+    return _extract_attribution(entries, compiled_patterns)
+
+
+def _settle_attribution(entries, held_attribution, compiled_patterns, position):
+    """Phase 2 (after shuffle/dropout): place the attribution at its final
+    position. If it was held out (immune case), reinsert it. If it wasn't
+    held out (not-immune case), it may or may not have survived dropout; if
+    it survived and position=='fixed', pin it back to the front, otherwise
+    leave it wherever shuffle/dropout left it.
+    """
+    if held_attribution is not None:
+        return _reinsert_attribution(entries, held_attribution, position)
+    if position == 'fixed':
+        found, rest = _extract_attribution(entries, compiled_patterns)
+        if found is not None:
+            return [found] + rest
+    return entries
+
+
+def _remove_attribution_from_text(text, compiled_patterns, delimiter):
+    """Strip any attribution entry out of an already-joined caption fragment.
+    `delimiter` is the tag delimiter (e.g. ', ') for tag-style text, or None
+    for NL-style text (split on sentences instead).
+    """
+    if not text:
+        return text
+    if delimiter is not None:
+        entries = [e.strip() for e in text.split(delimiter) if e.strip()]
+        entries = [e for e in entries if not _is_attribution(e, compiled_patterns)]
+        return delimiter.join(entries)
+    sentences = [s.strip() for s in text.split('. ') if s.strip()]
+    sentences = [s for s in sentences if not _is_attribution(s, compiled_patterns)]
+    if not sentences:
+        return ""
+    result = '. '.join(s.rstrip('.') for s in sentences)
+    if not result.endswith('.'):
+        result += '.'
+    return result
+
+
 def _select_variant(caption_mode, mixed_weights, has_nl_caption):
     """Pick a caption variant ('tags' | 'nl' | 'tags_nl' | 'nl_tags')."""
     if caption_mode == "tags":
@@ -169,18 +281,37 @@ def _select_variant(caption_mode, mixed_weights, has_nl_caption):
     return "tags"
 
 
-def _construct_caption(variant, processed_tags, processed_nl):
-    """Combine tag/NL components per the chosen variant, handling empties."""
+def _construct_caption(variant, processed_tags, processed_nl, attribution_patterns=None,
+                        dedupe_on_combine=True, tag_delimiter=', '):
+    """Combine tag/NL components per the chosen variant, handling empties.
+
+    When combining tags+NL (tags_nl / nl_tags) and `dedupe_on_combine` is on,
+    strip any attribution entry out of whichever section is NOT leading, so
+    e.g. "Drawn by X" isn't repeated once from the tags side and once from
+    the NL side in the same training caption.
+    """
     tags = processed_tags.strip() if processed_tags else ""
     nl = processed_nl.strip() if processed_nl else ""
+
+    if dedupe_on_combine and tags and nl and variant in ("tags_nl", "nl_tags"):
+        compiled = _compile_attribution_patterns(attribution_patterns)
+        if variant == "tags_nl":
+            nl = _remove_attribution_from_text(nl, compiled, delimiter=None)
+        else:  # nl_tags
+            tags = _remove_attribution_from_text(tags, compiled, delimiter=tag_delimiter)
+
     if variant == "tags":
         return tags if tags else nl
     if variant == "nl":
         return nl if nl else tags
     if variant == "tags_nl":
-        return f"{tags}. {nl}" if (tags and nl) else (tags or nl)
+        if tags and nl:
+            return f"{tags.rstrip('.,;: ')}. {nl}"
+        return tags or nl
     if variant == "nl_tags":
-        return f"{nl}. {tags}" if (tags and nl) else (nl or tags)
+        if tags and nl:
+            return f"{nl.rstrip('.,;: ')}. {tags}"
+        return nl or tags
     return tags or nl
 
 
@@ -220,13 +351,15 @@ def _print_debug(sample_idx, info, full_dropout):
         return
     print(f"├─ Original tags: \"{info.get('original_tags', '')}\"")
     nl = info.get('original_nl')
-    print(f"├─ Original NL: \"{(nl[:100] + '...') if nl and len(nl) > 100 else (nl or '(none)')}\"")
+    print(f"├─ Original NL: \"{nl or '(none)'}\"")
     if info.get('dropped_tags'):
         print(f"├─ Dropped tags: {info['dropped_tags']}")
     print(f"├─ Surviving tags: \"{info.get('surviving_tags', '')}\"")
+    if info.get('processed_nl'):
+        print(f"├─ Processed NL (post shuffle/attribution): \"{info['processed_nl']}\"")
     print(f"├─ Variant selected: {info.get('variant', 'unknown')}")
     final = info.get('final_caption', '')
-    print(f"└─ Final caption: \"{(final[:150] + '...') if len(final) > 150 else final}\"")
+    print(f"└─ Final caption: \"{final}\"")
 
 
 def log_caption_stats(debug_state, step, interval=1000):
@@ -271,9 +404,16 @@ def process_caption(tags_str, image_spec, config, protected_tags, sample_idx, de
     if should_debug:
         debug_info['original_nl'] = nl_caption
 
+    # Attribution policy setup (shared by tags and NL below).
+    attribution_patterns = _compile_attribution_patterns(config.get('attribution_patterns'))
+    attribution_immune = config.get('attribution_dropout_immune', True)
+    attribution_position = config.get('attribution_position', 'fixed')
+
     # Step 3: parse + shuffle + drop tags.
     delimiter = config.get('tag_delimiter', ', ')
     tags = [t.strip() for t in tags_str.split(delimiter) if t.strip()]
+
+    tag_attribution, tags = _pop_attribution_if_immune(tags, attribution_patterns, attribution_immune)
 
     if config.get('shuffle_tags', False):
         keep_first_n = config.get('shuffle_keep_first_n', 0)
@@ -291,21 +431,36 @@ def process_caption(tags_str, image_spec, config, protected_tags, sample_idx, de
     if dropout_percent > 0:
         tags, dropped_tags = _apply_tag_dropout(tags, dropout_percent, protected_indices, protected_tags)
         debug_state['tag_dropout_count'] = debug_state.get('tag_dropout_count', 0) + len(dropped_tags)
+
+    tags = _settle_attribution(tags, tag_attribution, attribution_patterns, attribution_position)
     processed_tags = delimiter.join(tags)
 
     if should_debug:
         debug_info['dropped_tags'] = dropped_tags
         debug_info['surviving_tags'] = processed_tags
 
-    # Step 4: process NL caption.
+    # Step 4: process NL caption (sentence shuffle + attribution policy).
     has_nl = bool(nl_caption and nl_caption.strip())
     processed_nl = ""
     if has_nl:
-        processed_nl = _process_nl_caption(
-            nl_caption,
-            config.get('nl_shuffle_sentences', False),
-            config.get('nl_keep_first_sentence', False),
-        )
+        sentences = [s.strip() for s in nl_caption.split('. ') if s.strip()]
+        nl_attribution, sentences = _pop_attribution_if_immune(sentences, attribution_patterns, attribution_immune)
+
+        if config.get('nl_shuffle_sentences', False) and len(sentences) > 1:
+            if config.get('nl_keep_first_sentence', False):
+                first, rest = sentences[0], sentences[1:]
+                random.shuffle(rest)
+                sentences = [first] + rest
+            else:
+                random.shuffle(sentences)
+
+        sentences = _settle_attribution(sentences, nl_attribution, attribution_patterns, attribution_position)
+        processed_nl = '. '.join(s.rstrip('.') for s in sentences)
+        if processed_nl and not processed_nl.endswith('.'):
+            processed_nl += '.'
+
+    if should_debug:
+        debug_info['processed_nl'] = processed_nl
 
     # Step 5: pick a variant and construct.
     mixed_weights = config.get('mixed_weights', DEFAULT_MIXED_WEIGHTS)
@@ -314,7 +469,12 @@ def process_caption(tags_str, image_spec, config, protected_tags, sample_idx, de
     if should_debug:
         debug_info['variant'] = variant
 
-    final_caption = _construct_caption(variant, processed_tags, processed_nl)
+    final_caption = _construct_caption(
+        variant, processed_tags, processed_nl,
+        attribution_patterns=config.get('attribution_patterns'),
+        dedupe_on_combine=config.get('attribution_dedupe_on_combine', True),
+        tag_delimiter=delimiter,
+    )
 
     # Step 6: never return empty (unless it was intentional CFG dropout above).
     if not final_caption or not final_caption.strip():
