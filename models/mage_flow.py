@@ -41,6 +41,7 @@ from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 from utils.offloading import ModelOffloader
 from utils import caption_processing as capproc
+from utils import validation_sampling as vsampling
 
 
 # Make the vendored Mage package importable (Mage/mage_flow -> `import mage_flow`).
@@ -615,6 +616,18 @@ class MageFlowPipeline(BasePipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def get_sampling_adapter(self):
+        if getattr(self, '_sampling_adapter', None) is None:
+            self._sampling_adapter = MageFlowSamplingAdapter(self)
+        return self._sampling_adapter
+
+    def sampling_device(self):
+        return torch.device('cuda')
+
+    def sampling_dtype(self):
+        # train.py resolves these to real torch.dtype objects via DTYPE_MAP.
+        return self.model_config.get('transformer_dtype') or self.model_config['dtype']
+
 
 class InitialLayer(nn.Module):
     def __init__(self, model, text_encoder=None, drop_idx=0):
@@ -716,3 +729,171 @@ class FinalLayer(nn.Module):
         hidden_states = self.norm_out.norm(hidden_states) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         output = self.proj_out(hidden_states)
         return output
+
+
+class MageFlowSamplingAdapter(vsampling.SamplingAdapter):
+    """Validation sampling for Mage-Flow.
+
+    Latents are [1, L, C] token sequences (MageVAE is a flat 16x downsample
+    with no patch packing, so L == (H/16) * (W/16) and tokens map 1:1 to latent
+    pixels). Guidance is classic dual-forward CFG: this architecture takes no
+    guidance vector as a model input, so there is nothing distilled to bypass.
+
+    Prompt embeddings are computed once by `prepare()` at startup, while the
+    text encoder is still loaded, and reused for every sampling round. That
+    keeps sampling working identically whether cache_text_embeddings is on
+    (where the encoder is unloaded after latent caching) or off, and avoids
+    holding a ~9 GB text encoder resident purely to re-encode a handful of
+    fixed prompts.
+    """
+
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self._embeds = {}
+        self._layers = None
+
+    # -- startup ---------------------------------------------------------
+
+    def prepare(self, prompt_strings):
+        """Encode every prompt we will ever need, before the text encoder is
+        unloaded. Returns False if the text encoder isn't usable.
+
+        Called before dataset caching, when the encoder may still be parked on
+        CPU. Quantized encoders (fp8/nf4) can't run there, so page it to GPU
+        for the encode and put it back exactly where it was.
+        """
+        te = getattr(self.pipeline, 'text_encoder', None)
+        if te is None or _is_meta_module(te):
+            print('Warning: Mage-Flow text encoder is not loaded; validation sampling disabled.')
+            self.supported = False
+            return False
+
+        missing = [p for p in prompt_strings if p not in self._embeds]
+        if not missing:
+            return True
+
+        was_on_cpu = not _module_is_cuda(te)
+        try:
+            if was_on_cpu and torch.cuda.is_available():
+                te.to('cuda')
+            for prompt in missing:
+                self._encode_and_cache(prompt, te)
+        except Exception as e:
+            print(f'Warning: failed to pre-encode sampling prompts ({type(e).__name__}: {e}); '
+                  'validation sampling disabled.')
+            self.supported = False
+            return False
+        finally:
+            if was_on_cpu:
+                te.to('cpu')
+        return True
+
+    def _encode_and_cache(self, prompt, te):
+        if prompt in self._embeds:
+            return self._embeds[prompt]
+        embeds = self.pipeline._encode_prompts([prompt], device=te.device)
+        # Keep on CPU; moved to the compute device per step. These are tiny
+        # relative to a training step's activations.
+        self._embeds[prompt] = [e.detach().to('cpu') for e in embeds]
+        return self._embeds[prompt]
+
+    # -- SamplingAdapter -------------------------------------------------
+
+    def encode_prompt(self, prompt):
+        if prompt in self._embeds:
+            return self._embeds[prompt]
+        # Not pre-encoded. With cache_text_embeddings = false (the common
+        # setup, since per-step tag shuffling and dropout require it) the text
+        # encoder stays resident for the whole run, so we can just encode now.
+        te = getattr(self.pipeline, 'text_encoder', None)
+        if te is not None and not _is_meta_module(te):
+            return self._encode_and_cache(prompt, te)
+        raise RuntimeError(
+            f'prompt was not pre-encoded at startup and the text encoder has been '
+            f'unloaded: {prompt!r}. All sampling prompts must go through prepare().')
+
+    def init_latents(self, width, height, generator, device, dtype):
+        h, w = math.ceil(height / 16), math.ceil(width / 16)
+        channels = self.pipeline.vae.latent_channels
+        # Generate on CPU so a given seed produces identical noise regardless
+        # of device or CUDA version, then move.
+        noise = torch.randn(1, channels, h, w, generator=generator, dtype=torch.float32)
+        noise = rearrange(noise, 'b c h w -> b (h w) c')
+        return noise.to(device=device, dtype=torch.float32)
+
+    def predict_velocity(self, latents, text_cond, sigma, width, height):
+        device = latents.device
+        h, w = math.ceil(height / 16), math.ceil(width / 16)
+        text0, text1 = self.pipeline._pad_cached_embeds(text_cond, device)
+        timestep = torch.full((1,), float(sigma), device=device, dtype=torch.float32)
+        img_hw = torch.tensor([[h, w]], dtype=torch.int32, device=device)
+        inputs = (latents.to(self.pipeline.sampling_dtype()), text0, text1, timestep, img_hw)
+        out = vsampling.run_layer_stack(self._sampling_layers(), inputs)
+        return out.float()
+
+    def decode(self, latents, width, height):
+        vae = self.pipeline.vae
+        if _is_meta_module(vae):
+            raise RuntimeError(
+                'The VAE was freed to the meta device after latent caching, so samples '
+                'cannot be decoded. Validation sampling should have set keep_vae_resident '
+                'before caching; this indicates the flag was not applied.')
+        h, w = math.ceil(height / 16), math.ceil(width / 16)
+        latents = rearrange(latents.float(), 'b (h w) c -> b c h w', h=h, w=w)
+
+        # The VAE is parked on CPU between sampling rounds so it costs host RAM
+        # rather than VRAM during training. Page it in to decode, then put it
+        # back so the next training step sees the same free VRAM it had before.
+        was_on_cpu = not _module_is_cuda(vae)
+        try:
+            if was_on_cpu:
+                vae.to('cuda')
+            device = torch.device('cuda')
+            with torch.autocast('cuda', dtype=AUTOCAST_DTYPE):
+                out = vae.decode(latents.to(device=device, dtype=AUTOCAST_DTYPE))
+        finally:
+            if was_on_cpu:
+                vae.to('cpu')
+
+        out = rearrange(out.float().clamp(-1, 1), 'b c h w -> b h w c')
+        arr = (127.5 * (out + 1.0)).cpu().byte().numpy()
+        from PIL import Image
+        return Image.fromarray(arr[0])
+
+    # -- internals -------------------------------------------------------
+
+    def _sampling_layers(self):
+        """Layer stack forced onto the cached-embeddings path.
+
+        `to_layers()` hands InitialLayer a live text encoder in on-the-fly
+        caption mode, which makes it interpret its text inputs as token ids.
+        Sampling always supplies precomputed embeddings, so it builds its own
+        stack with text_encoder=None. The wrappers only hold references to the
+        same modules (and the same offloader), so this shares all weights and
+        keeps block swapping working.
+        """
+        if self._layers is None:
+            transformer = self.pipeline.transformer
+            layers = [InitialLayer(transformer, text_encoder=None,
+                                   drop_idx=PROMPT_TEMPLATE_ENCODE_START_IDX)]
+            for i, block in enumerate(transformer.transformer_blocks):
+                layers.append(TransformerLayer(
+                    block, i, transformer.num_attention_heads, self.pipeline.offloader))
+            layers.append(FinalLayer(transformer))
+            self._layers = layers
+        return self._layers
+
+
+def _is_meta_module(module):
+    """True if a module's weights were freed to the meta device after caching."""
+    try:
+        return any(p.device.type == 'meta' for p in module.parameters())
+    except (StopIteration, AttributeError):
+        return False
+
+
+def _module_is_cuda(module):
+    try:
+        return next(module.parameters()).device.type == 'cuda'
+    except (StopIteration, AttributeError):
+        return False
