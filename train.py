@@ -950,6 +950,13 @@ if __name__ == '__main__':
                 warnings.warn("Using local optimizers/stage_lr.py; pip install stage-lr for standalone package: pip install git+https://github.com/nruaif/stage-lr.git")
         total_iters = stage_cfg.get('total_iters') or stage_cfg.get('total_steps') or (config['epochs'] * steps_per_epoch)
         warmup_steps = stage_cfg.get('warmup_steps', config.get('warmup_steps', 0))
+        if is_main_process():
+            source = 'explicit [StageLR].total_iters' if (stage_cfg.get('total_iters') or stage_cfg.get('total_steps')) else \
+                f"computed from steps_per_epoch ({steps_per_epoch}) x epochs ({config['epochs']})"
+            print(f'StageLR: total_iters={total_iters} ({source}), warmup_steps={warmup_steps}')
+            for s in stage_cfg['stages']:
+                n = max(1, round(s['percent'] * total_iters))
+                print(f"  stage '{s['type']}': {n} steps ({s['percent']*100:.0f}% of total_iters)")
         lr_scheduler = StageLR(optimizer, stages=stage_cfg['stages'], total_iters=total_iters, warmup_steps=warmup_steps)
     elif raw_scheduler == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
