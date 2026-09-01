@@ -43,6 +43,7 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils import validation_sampling
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -218,6 +219,12 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
         pbar = None
 
     start = time.time()
+    # Collected across the whole eval round and logged to wandb in a single
+    # call at the end, all sharing one explicit step=. wandb.log() advances
+    # its own internal step counter once per call regardless of what a 'step'
+    # dict key says, so several separate calls for one eval round would drift
+    # wandb's x-axis away from the actual training step shown in the console.
+    wandb_log_dict = {}
     for name, eval_dataloader in eval_dataloaders.items():
         losses = []
         for quantile in TIMESTEP_QUANTILES_FOR_EVAL:
@@ -226,18 +233,19 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             if is_main_process():
                 tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
                 if wandb_enable:
-                    wandb.log({f'{name}/loss_quantile_{quantile:.2f}': loss, 'step': step})
+                    wandb_log_dict[f'{name}/loss_quantile_{quantile:.2f}'] = loss
         avg_loss = sum(losses) / len(losses)
         if is_main_process():
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
             if wandb_enable:
-                wandb.log({f'{name}/loss': avg_loss, 'step': step})
+                wandb_log_dict[f'{name}/loss'] = avg_loss
 
     duration = time.time() - start
     if is_main_process():
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
         if wandb_enable:
-            wandb.log({'eval/eval_time_sec': duration, 'step': step})
+            wandb_log_dict['eval/eval_time_sec'] = duration
+            wandb.log(wandb_log_dict, step=step)
         pbar.close()
 
 
@@ -267,6 +275,41 @@ def distributed_init(args):
     os.environ['MASTER_PORT'] = str(args.master_port)
 
     return world_size, rank, local_rank
+
+
+def _get_param_group_lrs(optimizer):
+    """Current LR of each param group, de-duplicated, in order.
+
+    Read from param_groups rather than lr_scheduler.get_last_lr(): SequentialLR
+    (this repo's warmup path) and ChainedScheduler have shipped in torch
+    versions where get_last_lr() raises AttributeError because they never
+    populate _last_lr, whereas param_groups is always current immediately after
+    step(). Uses .get() because a custom optimizer is not obliged to put 'lr' in
+    its defaults, and a missing LR should degrade logging rather than kill a run
+    that is otherwise fine.
+
+    De-duplicates because most configs give every group the same LR, and
+    GenericOptim splits params into 2d/other groups that normally share one.
+    A second value only appears when groups genuinely differ.
+    """
+    lrs = []
+    for pg in getattr(optimizer, 'param_groups', []):
+        try:
+            lr = pg.get('lr')
+        except AttributeError:
+            continue
+        if lr is None:
+            continue
+        lr = float(lr)
+        if lr not in lrs:
+            lrs.append(lr)
+    return lrs
+
+
+def _format_lrs(lrs):
+    if not lrs:
+        return 'n/a'
+    return ' / '.join(f'{lr:.3e}' for lr in lrs)
 
 
 def get_prodigy_d(optimizer):
@@ -517,6 +560,43 @@ if __name__ == '__main__':
                         break
         dist.barrier()
         quit()
+
+    # Validation sampling setup must happen BEFORE dataset_manager.cache(),
+    # which frees submodels to the 'meta' device. Sampling needs the VAE at
+    # every round to decode latents, and (in cache_text_embeddings mode) needs
+    # the text encoder to embed the sample prompts at least once.
+    sampling_config = validation_sampling.build_sampling_config(config)
+    if sampling_config is not None:
+        if config.get('pipeline_stages', 1) > 1:
+            # to_layers() is partitioned across stages, so no single rank holds
+            # the whole model, and generation needs the full stack. Rather than
+            # crash mid-run, disable and say so clearly.
+            if is_main_process():
+                print('Warning: validation sampling requires pipeline_stages = 1 '
+                      f"(got {config['pipeline_stages']}); sampling is disabled for this run.")
+            sampling_config = None
+        else:
+            model.keep_vae_resident = True
+            adapter = model.get_sampling_adapter()
+            if adapter is None:
+                if is_main_process():
+                    print(f"Warning: model type '{config['model']['type']}' does not support "
+                          'validation sampling yet; sampling is disabled for this run.')
+                sampling_config = None
+                model.keep_vae_resident = False
+            else:
+                # Encode the fixed prompt set now, while the text encoder is
+                # guaranteed to be loaded. With cache_text_embeddings = true it
+                # is freed by the caching step below; with it false the encoder
+                # stays resident, but pre-encoding is still cheaper than
+                # re-encoding the same prompts every round.
+                prompt_strings = {p['prompt'] for p in sampling_config['prompts']}
+                prompt_strings |= {p['negative_prompt'] for p in sampling_config['prompts']
+                                   if validation_sampling.uses_negative_branch(
+                                       p['cfg'], p['negative_prompt'])}
+                if not adapter.prepare(sorted(prompt_strings)):
+                    sampling_config = None
+                    model.keep_vae_resident = False
 
     dataset_manager.cache()
     if args.cache_only:
@@ -936,6 +1016,21 @@ if __name__ == '__main__':
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
+    # Sampling round counter, used by the 'walk' seed strategy so each round
+    # advances the seed. Fixed seeds (the default) ignore it.
+    sampling_round = 0
+    if sampling_config is not None and sampling_config['sample_at_first'] and not resume_from_checkpoint:
+        # A pre-training baseline gives the "before" half of every before/after
+        # comparison for free, and surfaces a broken sampling config in the
+        # first minute of a run instead of at the end of epoch 1.
+        if is_main_process():
+            validation_sampling.generate_and_log_samples(
+                model, sampling_config, tb_writer, 0, run_dir, 'step0_baseline',
+                sampling_round, wandb_module=(wandb if wandb_enable else None),
+                disable_block_swap=disable_block_swap_for_eval)
+        sampling_round += 1
+        dist.barrier()
+
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
     epoch_loss = 0
     num_steps = 0
@@ -957,10 +1052,42 @@ if __name__ == '__main__':
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+
+            # Learning rate. DeepSpeed's own per-step line reports steps, loss,
+            # iter time and samples/sec but never the LR or the epoch, so
+            # without this a schedule like StageLR is invisible both in the
+            # terminal and in wandb/TensorBoard until a run has finished.
+            lrs = _get_param_group_lrs(optimizer)
+            if lrs:
+                tb_writer.add_scalar(f'train/lr', lrs[0], x_axis)
+                # Only present when param groups genuinely disagree.
+                for i, group_lr in enumerate(lrs[1:], start=1):
+                    tb_writer.add_scalar(f'train/lr_group{i}', group_lr, x_axis)
+            tb_writer.add_scalar(f'train/epoch', epoch, x_axis)
+
             if wandb_enable:
-                wandb.log({'train/loss': loss, 'step': x_axis})
+                log_dict = {'train/loss': loss, 'train/epoch': epoch}
+                if lrs:
+                    log_dict['train/lr'] = lrs[0]
+                    for i, group_lr in enumerate(lrs[1:], start=1):
+                        log_dict[f'train/lr_group{i}'] = group_lr
                 if hasattr(optimizer, '_grad_norm'):
-                    wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+                    log_dict['train/grad_norm'] = optimizer._grad_norm
+                # step= is the actual x-axis wandb uses; a 'step' dict key is
+                # just another metric column and does NOT control it. Every
+                # wandb.log() call advances wandb's own internal step counter
+                # by one regardless of what's inside the dict, so two separate
+                # calls here would silently push wandb's x-axis two steps
+                # ahead of the console/TensorBoard step for this one iteration.
+                wandb.log(log_dict, step=x_axis)
+
+            if config.get('log_lr_to_console', True):
+                msg = (f'epoch: {epoch}  step: {step}  '
+                       f'lr: {_format_lrs(lrs)}  loss: {loss:.4f}')
+                if hasattr(optimizer, '_grad_norm'):
+                    msg += f'  grad_norm: {optimizer._grad_norm:.4f}'
+                print(msg)
+
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
@@ -973,11 +1100,34 @@ if __name__ == '__main__':
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
+        # Validation sampling runs on its own cadence, separate from eval:
+        # loss eval is one forward pass, while sampling is a full denoising
+        # loop per prompt, so most runs want it far less often.
+        if validation_sampling.should_sample(sampling_config, step, epoch, finished_epoch):
+            if is_main_process():
+                label = f'epoch{epoch}' if finished_epoch else f'step{step}'
+                validation_sampling.generate_and_log_samples(
+                    model, sampling_config, tb_writer, x_axis, run_dir, label,
+                    sampling_round, wandb_module=(wandb if wandb_enable else None),
+                    disable_block_swap=disable_block_swap_for_eval)
+            sampling_round += 1
+            # Non-main ranks wait so nobody starts the next training step while
+            # rank 0 is still holding the GPU for generation.
+            dist.barrier()
+
         if finished_epoch:
             if is_main_process():
+                # Note the deliberate x-axis asymmetry: TensorBoard plots this
+                # against `epoch`, wandb against `x_axis`. They cannot match.
+                # wandb requires steps to be non-decreasing across all log()
+                # calls and silently DROPS anything logged at a lower step than
+                # one already seen. Epoch numbers are always far below the
+                # current step, so step=epoch here would discard every single
+                # epoch_loss point. TensorBoard has no such constraint and
+                # keeps per-metric x-axes independent.
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
                 if wandb_enable:
-                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
+                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'train/epoch': epoch}, step=x_axis)
             epoch_loss = 0
             num_steps = 0
             if new_epoch is None:

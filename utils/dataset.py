@@ -1181,11 +1181,18 @@ class DatasetManager:
         if unload_models:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
             # TODO: check if this is actually freeing memory.
+            keep_vae = getattr(self.model, 'keep_vae_resident', False)
             for model in self.submodels:
                 if not isinstance(model, nn.Module):
                     continue
                 if self.model.name == 'sdxl' and model is self.vae:
                     # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
+                    model.to('cpu')
+                elif keep_vae and model is self.vae:
+                    # Validation sampling has to VAE-decode its latents every
+                    # sampling round, and 'meta' would free the weights outright.
+                    # Park it on CPU instead and page it to GPU only while
+                    # decoding, which costs host RAM rather than VRAM.
                     model.to('cpu')
                 else:
                     model.to('meta')

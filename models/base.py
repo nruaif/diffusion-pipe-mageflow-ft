@@ -324,6 +324,23 @@ class BasePipeline:
     def model_specific_dataset_config_validation(self, dataset_config):
         pass
 
+    # --- Inference validation sampling ---------------------------------
+    # Models that can generate images during training return a
+    # utils.validation_sampling.SamplingAdapter here. Returning None (the
+    # default) means "this model doesn't support validation sampling yet",
+    # which the training loop reports once at startup and then skips, rather
+    # than failing a run that is otherwise fine.
+
+    def get_sampling_adapter(self):
+        return None
+
+    def sampling_device(self):
+        return torch.device('cuda')
+
+    def sampling_dtype(self):
+        dtype = self.model_config.get('transformer_dtype') or self.model_config.get('dtype')
+        return dtype if isinstance(dtype, torch.dtype) else torch.bfloat16
+
     # Get param groups that will be passed into the optimizer. Models can override this, e.g. SDXL
     # supports separate learning rates for unet and text encoders.
     def get_param_groups(self, parameters):
