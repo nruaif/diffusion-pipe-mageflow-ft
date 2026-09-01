@@ -28,6 +28,7 @@ activation_checkpointing = true
 save_dtype = 'bfloat16'
 caching_batch_size = 8
 steps_per_print = 1
+log_lr_to_console = true # Disable if you find it annoying
  
 [model]
 type = 'mage_flow'

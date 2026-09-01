@@ -270,6 +270,41 @@ def distributed_init(args):
     return world_size, rank, local_rank
 
 
+def _get_param_group_lrs(optimizer):
+    """Current LR of each param group, de-duplicated, in order.
+
+    Read from param_groups rather than lr_scheduler.get_last_lr(): SequentialLR
+    (this repo's warmup path) and ChainedScheduler have shipped in torch
+    versions where get_last_lr() raises AttributeError because they never
+    populate _last_lr, whereas param_groups is always current immediately after
+    step(). Uses .get() because a custom optimizer is not obliged to put 'lr' in
+    its defaults, and a missing LR should degrade logging rather than kill a run
+    that is otherwise fine.
+
+    De-duplicates because most configs give every group the same LR, and
+    GenericOptim splits params into 2d/other groups that normally share one.
+    A second value only appears when groups genuinely differ.
+    """
+    lrs = []
+    for pg in getattr(optimizer, 'param_groups', []):
+        try:
+            lr = pg.get('lr')
+        except AttributeError:
+            continue
+        if lr is None:
+            continue
+        lr = float(lr)
+        if lr not in lrs:
+            lrs.append(lr)
+    return lrs
+
+
+def _format_lrs(lrs):
+    if not lrs:
+        return 'n/a'
+    return ' / '.join(f'{lr:.3e}' for lr in lrs)
+
+
 def get_prodigy_d(optimizer):
     d = 0
     for group in optimizer.param_groups:
@@ -1010,10 +1045,36 @@ if __name__ == '__main__':
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+
+            # Learning rate. DeepSpeed's own per-step line reports steps, loss,
+            # iter time and samples/sec but never the LR or the epoch, so
+            # without this a schedule like StageLR is invisible both in the
+            # terminal and in wandb/TensorBoard until a run has finished.
+            lrs = _get_param_group_lrs(optimizer)
+            if lrs:
+                tb_writer.add_scalar(f'train/lr', lrs[0], x_axis)
+                # Only present when param groups genuinely disagree.
+                for i, group_lr in enumerate(lrs[1:], start=1):
+                    tb_writer.add_scalar(f'train/lr_group{i}', group_lr, x_axis)
+            tb_writer.add_scalar(f'train/epoch', epoch, x_axis)
+
             if wandb_enable:
-                wandb.log({'train/loss': loss, 'step': x_axis})
+                log_dict = {'train/loss': loss, 'train/epoch': epoch, 'step': x_axis}
+                if lrs:
+                    log_dict['train/lr'] = lrs[0]
+                    for i, group_lr in enumerate(lrs[1:], start=1):
+                        log_dict[f'train/lr_group{i}'] = group_lr
+                wandb.log(log_dict)
                 if hasattr(optimizer, '_grad_norm'):
                     wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+
+            if config.get('log_lr_to_console', True):
+                msg = (f'epoch: {epoch}  step: {step}  '
+                       f'lr: {_format_lrs(lrs)}  loss: {loss:.4f}')
+                if hasattr(optimizer, '_grad_norm'):
+                    msg += f'  grad_norm: {optimizer._grad_norm:.4f}'
+                print(msg)
+
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
