@@ -219,6 +219,12 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
         pbar = None
 
     start = time.time()
+    # Collected across the whole eval round and logged to wandb in a single
+    # call at the end, all sharing one explicit step=. wandb.log() advances
+    # its own internal step counter once per call regardless of what a 'step'
+    # dict key says, so several separate calls for one eval round would drift
+    # wandb's x-axis away from the actual training step shown in the console.
+    wandb_log_dict = {}
     for name, eval_dataloader in eval_dataloaders.items():
         losses = []
         for quantile in TIMESTEP_QUANTILES_FOR_EVAL:
@@ -227,18 +233,19 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             if is_main_process():
                 tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
                 if wandb_enable:
-                    wandb.log({f'{name}/loss_quantile_{quantile:.2f}': loss, 'step': step})
+                    wandb_log_dict[f'{name}/loss_quantile_{quantile:.2f}'] = loss
         avg_loss = sum(losses) / len(losses)
         if is_main_process():
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
             if wandb_enable:
-                wandb.log({f'{name}/loss': avg_loss, 'step': step})
+                wandb_log_dict[f'{name}/loss'] = avg_loss
 
     duration = time.time() - start
     if is_main_process():
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
         if wandb_enable:
-            wandb.log({'eval/eval_time_sec': duration, 'step': step})
+            wandb_log_dict['eval/eval_time_sec'] = duration
+            wandb.log(wandb_log_dict, step=step)
         pbar.close()
 
 
@@ -1059,14 +1066,20 @@ if __name__ == '__main__':
             tb_writer.add_scalar(f'train/epoch', epoch, x_axis)
 
             if wandb_enable:
-                log_dict = {'train/loss': loss, 'train/epoch': epoch, 'step': x_axis}
+                log_dict = {'train/loss': loss, 'train/epoch': epoch}
                 if lrs:
                     log_dict['train/lr'] = lrs[0]
                     for i, group_lr in enumerate(lrs[1:], start=1):
                         log_dict[f'train/lr_group{i}'] = group_lr
-                wandb.log(log_dict)
                 if hasattr(optimizer, '_grad_norm'):
-                    wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+                    log_dict['train/grad_norm'] = optimizer._grad_norm
+                # step= is the actual x-axis wandb uses; a 'step' dict key is
+                # just another metric column and does NOT control it. Every
+                # wandb.log() call advances wandb's own internal step counter
+                # by one regardless of what's inside the dict, so two separate
+                # calls here would silently push wandb's x-axis two steps
+                # ahead of the console/TensorBoard step for this one iteration.
+                wandb.log(log_dict, step=x_axis)
 
             if config.get('log_lr_to_console', True):
                 msg = (f'epoch: {epoch}  step: {step}  '
@@ -1104,9 +1117,17 @@ if __name__ == '__main__':
 
         if finished_epoch:
             if is_main_process():
+                # Note the deliberate x-axis asymmetry: TensorBoard plots this
+                # against `epoch`, wandb against `x_axis`. They cannot match.
+                # wandb requires steps to be non-decreasing across all log()
+                # calls and silently DROPS anything logged at a lower step than
+                # one already seen. Epoch numbers are always far below the
+                # current step, so step=epoch here would discard every single
+                # epoch_loss point. TensorBoard has no such constraint and
+                # keeps per-metric x-axes independent.
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
                 if wandb_enable:
-                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
+                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'train/epoch': epoch}, step=x_axis)
             epoch_loss = 0
             num_steps = 0
             if new_epoch is None:

@@ -7,7 +7,6 @@ a malformed or exotic optimizer degrades logging instead of crashing a run.
 Run with: python3 -m pytest test/test_lr_logging.py -q
 """
 
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -16,8 +15,6 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-
-
 
 
 # train.py guards everything behind `if __name__ == '__main__':`, so importing

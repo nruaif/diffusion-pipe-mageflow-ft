@@ -249,3 +249,56 @@ def test_fixed_seed_reproduces_noise_between_rounds(tmp_path):
     generate_and_log_samples(m, c, None, 1, tmp_path, 'r0', round_index=0)
     generate_and_log_samples(m, c, None, 2, tmp_path, 'r1', round_index=1)
     assert torch.equal(a.init_noise[0], a.init_noise[1])
+
+
+# --- wandb call shape (regression guards for the step-alignment fix) --------
+
+class RecordingWandb:
+    """Mock that enforces the two properties the step fix depends on."""
+
+    def __init__(self):
+        self.calls = []
+
+    def log(self, data, step=None):
+        assert step is not None, 'wandb.log() called without step='
+        assert 'step' not in data, "'step' passed as a dict key instead of step="
+        self.calls.append((step, sorted(data.keys())))
+
+    def Image(self, *a, **k):
+        return ('Image', a, k)
+
+
+def test_sampling_round_makes_exactly_one_wandb_call(cfg, tmp_path):
+    # Previously this cost two calls (gallery, then sample_time_sec), which
+    # advanced wandb's internal step counter twice for one logical step.
+    wb = RecordingWandb()
+    generate_and_log_samples(MockModel(), cfg, None, 42, tmp_path, 'r', 0, wandb_module=wb)
+    assert len(wb.calls) == 1, wb.calls
+    step, keys = wb.calls[0]
+    assert step == 42
+    assert keys == ['samples', 'samples/sample_time_sec']
+
+
+def test_all_prompts_failing_still_logs_timing_at_the_right_step(cfg, tmp_path):
+    # The round must stay visible on wandb's x-axis even with zero images,
+    # and must not create an empty samples/ directory on disk.
+    class AlwaysFails(MockAdapter):
+        def predict_velocity(self, *a, **k):
+            raise RuntimeError('boom')
+
+    wb = RecordingWandb()
+    generate_and_log_samples(MockModel(AlwaysFails()), cfg, None, 13, tmp_path, 'r', 0,
+                             wandb_module=wb)
+    assert len(wb.calls) == 1, wb.calls
+    step, keys = wb.calls[0]
+    assert step == 13
+    assert keys == ['samples/sample_time_sec']
+    assert not (tmp_path / 'samples').exists()
+
+
+def test_log_to_wandb_false_makes_no_wandb_calls(tmp_path):
+    c = build_sampling_config({'sampling': {
+        'prompts': ['a'], 'steps': 2, 'cfg': 1.0, 'log_to_wandb': False}})
+    wb = RecordingWandb()
+    generate_and_log_samples(MockModel(), c, None, 5, tmp_path, 'r', 0, wandb_module=wb)
+    assert wb.calls == []

@@ -424,16 +424,17 @@ def _annotate(image, text):
 
 
 def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
-                wandb_module=None):
+                wandb_module=None, duration=None):
     """Write generated samples to wandb, TensorBoard, and disk.
 
-    `results` is a list of (prompt_settings, seed, PIL image). Every sink is
-    best-effort and independently guarded: a wandb hiccup must never take down
-    a training run that has been going for hours.
+    `results` is a list of (prompt_settings, seed, PIL image), possibly empty
+    if every prompt in the round failed. Every sink is best-effort and
+    independently guarded: a wandb hiccup must never take down a training run
+    that has been going for hours.
     """
     import numpy as np
 
-    if sampling_config['save_to_disk'] and run_dir is not None:
+    if sampling_config['save_to_disk'] and run_dir is not None and results:
         out_dir = Path(run_dir) / 'samples' / label
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -444,11 +445,24 @@ def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
 
     if sampling_config['log_to_wandb'] and wandb_module is not None:
         try:
-            images = [
-                wandb_module.Image(image, caption=_caption_for(settings, seed))
-                for settings, seed, image in results
-            ]
-            wandb_module.log({'samples': images, 'step': step})
+            # One wandb.log() call for the whole round, whether or not any
+            # prompt succeeded. step= (not a 'step' dict key) is what actually
+            # controls wandb's x-axis, and every separate .log() call advances
+            # wandb's own internal step counter by one regardless of what's in
+            # the dict — a sampling round used to cost two separate calls (the
+            # gallery, then sample_time_sec afterward), silently pushing
+            # wandb's x-axis two steps ahead of the console/TensorBoard step
+            # for a single logical training step.
+            wandb_log_dict = {}
+            if results:
+                wandb_log_dict['samples'] = [
+                    wandb_module.Image(image, caption=_caption_for(settings, seed))
+                    for settings, seed, image in results
+                ]
+            if duration is not None:
+                wandb_log_dict['samples/sample_time_sec'] = duration
+            if wandb_log_dict:
+                wandb_module.log(wandb_log_dict, step=step)
         except Exception as e:
             print(f'Warning: failed to log samples to wandb: {e}')
 
@@ -510,18 +524,16 @@ def generate_and_log_samples(model, sampling_config, tb_writer, step, run_dir,
         model.prepare_block_swap_training()
 
     duration = time.time() - start
-    if results:
-        log_samples(results, sampling_config, tb_writer, step, run_dir, label,
-                    wandb_module=wandb_module)
+    # Always call this, even if every prompt failed: it's what actually
+    # fires the (now single) wandb.log() for this round, and skipping it
+    # on an all-failed round would leave that round invisible on wandb's
+    # x-axis entirely rather than showing zero images with a timing point.
+    log_samples(results, sampling_config, tb_writer, step, run_dir, label,
+                wandb_module=wandb_module, duration=duration)
     print(f'Generated {len(results)}/{len(prompts)} sample(s) in {duration:.1f}s')
 
     if tb_writer is not None:
         try:
             tb_writer.add_scalar('samples/sample_time_sec', duration, step)
-        except Exception:
-            pass
-    if wandb_module is not None and sampling_config['log_to_wandb']:
-        try:
-            wandb_module.log({'samples/sample_time_sec': duration, 'step': step})
         except Exception:
             pass
