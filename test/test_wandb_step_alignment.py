@@ -24,16 +24,29 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+# Names that refer to a logging backend or the tracker wrapper. Any `.log()`
+# on one of these must pass an explicit step=.
+_LOG_RECEIVERS = ('wandb', 'wandb_module', 'tracker', 'trackio')
+
+
 def _find_wandb_log_calls(path):
-    """Return every wandb*.log(...) Call node in a source file."""
+    """Return every <backend>.log(...) Call node in a source file.
+
+    Covers both a bare name (`tracker.log(...)`) and an attribute chain
+    (`self.wandb.log(...)`, `self.trackio.log(...)`) so the backend
+    implementations inside utils/tracking.py are checked too.
+    """
     tree = ast.parse(path.read_text())
     calls = []
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call)
+        if not (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'log'
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in ('wandb', 'wandb_module')):
+                and node.func.attr == 'log'):
+            continue
+        recv = node.func.value
+        if isinstance(recv, ast.Name) and recv.id in _LOG_RECEIVERS:
+            calls.append(node)
+        elif isinstance(recv, ast.Attribute) and recv.attr in _LOG_RECEIVERS:
             calls.append(node)
     return calls
 
@@ -55,7 +68,7 @@ def test_every_wandb_log_call_in_trainpy_has_explicit_step_kwarg():
 
 def test_every_wandb_log_call_in_validation_sampling_has_explicit_step_kwarg():
     calls = _find_wandb_log_calls(ROOT / 'utils' / 'validation_sampling.py')
-    assert calls, 'expected to find wandb_module.log() calls in validation_sampling.py'
+    assert calls, 'expected to find tracker.log() calls in validation_sampling.py'
     missing = [c.lineno for c in calls
                if not any(kw.arg == 'step' for kw in c.keywords)]
     assert not missing, f'wandb_module.log() call(s) missing step= kwarg at line(s): {missing}'
@@ -65,7 +78,8 @@ def test_no_wandb_log_call_carries_a_step_dict_key():
     # The old bug: {'metric': v, 'step': x} with no step= kwarg. Even after
     # adding step=, a lingering 'step' dict key alongside it is at best
     # confusing (a redundant 'step' column) and is worth catching too.
-    for path in (ROOT / 'train.py', ROOT / 'utils' / 'validation_sampling.py'):
+    for path in (ROOT / 'train.py', ROOT / 'utils' / 'validation_sampling.py',
+                 ROOT / 'utils' / 'tracking.py'):
         for call in _find_wandb_log_calls(path):
             d = _dict_arg(call)
             if d is None:
@@ -111,3 +125,12 @@ def test_train_step_count_across_a_logical_step_is_exactly_one_call():
     # No step value should have been skipped or duplicated beyond what each
     # logical step's own set of events warrants (2, 2, 3 calls for steps 1,2,3).
     assert wb.calls == [1, 1, 2, 2, 2, 3, 3, 3], wb.calls
+
+
+def test_every_backend_log_call_in_tracking_has_explicit_step_kwarg():
+    """The wandb/trackio backends inside tracking.py must forward step= too."""
+    calls = _find_wandb_log_calls(ROOT / 'utils' / 'tracking.py')
+    assert calls, 'expected to find backend .log() calls in tracking.py'
+    missing = [c.lineno for c in calls
+               if not any(kw.arg == 'step' for kw in c.keywords)]
+    assert not missing, f'backend .log() missing step= at line(s): {missing}'

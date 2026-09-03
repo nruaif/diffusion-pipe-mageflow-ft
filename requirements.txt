@@ -27,6 +27,9 @@ easydict
 ftfy
 pytorch-optimizer
 wandb
+# Optional: only needed for [monitoring] tracker = 'trackio'. Pinned because
+# Trackio is pre-release and its storage schema can change between versions.
+trackio==0.37.0
 optimum-quanto
 wheel
 ninja

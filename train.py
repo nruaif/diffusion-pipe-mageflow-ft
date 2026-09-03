@@ -10,7 +10,7 @@ import warnings
 warnings.filterwarnings('ignore', category=FutureWarning, message=r'_check_is_size will be removed.*')
 warnings.filterwarnings('ignore', category=FutureWarning, module=r'bitsandbytes\._ops')
 
-import wandb
+from utils import tracking
 # Disable comfy_kitchen during training to avoid autograd errors
 sys.modules["comfy_kitchen"] = None
 from datetime import datetime, timezone
@@ -48,7 +48,9 @@ from utils import validation_sampling
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
 
-wandb_enable = False
+# The active experiment tracker (wandb / trackio / none). Set in main; a
+# NullTracker until then so any early log() call is a harmless no-op.
+tracker = tracking.NullTracker()
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -106,6 +108,9 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 def set_config_defaults(config):
     # Force the user to set this. If we made it a default of 1, it might use a lot of disk space.
     assert 'save_every_n_epochs' in config or 'save_every_n_steps' in config or 'save_every_n_examples' in config
+
+    # Fail fast on a bad tracker name rather than 40 minutes into caching.
+    tracking.resolve_tracker_name(config)
 
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
@@ -232,20 +237,20 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             losses.append(loss)
             if is_main_process():
                 tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
-                if wandb_enable:
+                if tracker.enabled:
                     wandb_log_dict[f'{name}/loss_quantile_{quantile:.2f}'] = loss
         avg_loss = sum(losses) / len(losses)
         if is_main_process():
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
-            if wandb_enable:
+            if tracker.enabled:
                 wandb_log_dict[f'{name}/loss'] = avg_loss
 
     duration = time.time() - start
     if is_main_process():
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
-        if wandb_enable:
+        if tracker.enabled:
             wandb_log_dict['eval/eval_time_sec'] = duration
-            wandb.log(wandb_log_dict, step=step)
+            tracker.log(wandb_log_dict, step=step)
         pbar.close()
 
 
@@ -631,20 +636,10 @@ if __name__ == '__main__':
     else:  # Not resuming, use most recent (newly created) dir
         run_dir = get_most_recent_run_dir(config['output_dir'])
 
-    # WandB logging
-    wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
-    if wandb_enable and is_main_process():
-        wandb_api_key     = config['monitoring']['wandb_api_key']
-        wandb_tracker     = config['monitoring']['wandb_tracker_name']
-        wandb_run_name    = config['monitoring']['wandb_run_name']
-        logging_dir       = run_dir
-        wandb.login(key=wandb_api_key)
-        wandb.init(
-            project=wandb_tracker,
-            name=wandb_run_name,
-            config=config,
-            dir=logging_dir
-        )
+    # Experiment tracking (wandb / trackio / none), selected by
+    # [monitoring] tracker. build_tracker never raises: a backend that fails to
+    # start returns a disabled tracker and training proceeds regardless.
+    tracker = tracking.build_tracker(config, run_dir, is_main=is_main_process())
 
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
@@ -1033,7 +1028,7 @@ if __name__ == '__main__':
         if is_main_process():
             validation_sampling.generate_and_log_samples(
                 model, sampling_config, tb_writer, 0, run_dir, 'step0_baseline',
-                sampling_round, wandb_module=(wandb if wandb_enable else None),
+                sampling_round, tracker=tracker,
                 disable_block_swap=disable_block_swap_for_eval)
         sampling_round += 1
         dist.barrier()
@@ -1072,7 +1067,7 @@ if __name__ == '__main__':
                     tb_writer.add_scalar(f'train/lr_group{i}', group_lr, x_axis)
             tb_writer.add_scalar(f'train/epoch', epoch, x_axis)
 
-            if wandb_enable:
+            if tracker.enabled:
                 log_dict = {'train/loss': loss, 'train/epoch': epoch}
                 if lrs:
                     log_dict['train/lr'] = lrs[0]
@@ -1086,7 +1081,7 @@ if __name__ == '__main__':
                 # by one regardless of what's inside the dict, so two separate
                 # calls here would silently push wandb's x-axis two steps
                 # ahead of the console/TensorBoard step for this one iteration.
-                wandb.log(log_dict, step=x_axis)
+                tracker.log(log_dict, step=x_axis)
 
             if config.get('log_lr_to_console', True):
                 msg = (f'epoch: {epoch}  step: {step}  '
@@ -1115,7 +1110,7 @@ if __name__ == '__main__':
                 label = f'epoch{epoch}' if finished_epoch else f'step{step}'
                 validation_sampling.generate_and_log_samples(
                     model, sampling_config, tb_writer, x_axis, run_dir, label,
-                    sampling_round, wandb_module=(wandb if wandb_enable else None),
+                    sampling_round, tracker=tracker,
                     disable_block_swap=disable_block_swap_for_eval)
             sampling_round += 1
             # Non-main ranks wait so nobody starts the next training step while
@@ -1133,8 +1128,8 @@ if __name__ == '__main__':
                 # epoch_loss point. TensorBoard has no such constraint and
                 # keeps per-metric x-axes independent.
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
-                if wandb_enable:
-                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'train/epoch': epoch}, step=x_axis)
+                if tracker.enabled:
+                    tracker.log({'train/epoch_loss': epoch_loss/num_steps, 'train/epoch': epoch}, step=x_axis)
             epoch_loss = 0
             num_steps = 0
             if new_epoch is None:
@@ -1156,4 +1151,5 @@ if __name__ == '__main__':
         saver.save_model(final_model_name)
 
     if is_main_process():
-        print('TRAINING COMPLETE!')
+        tracker.finish()
+    print('TRAINING COMPLETE!')

@@ -216,17 +216,19 @@ def test_disk_logging_can_be_disabled(tmp_path):
 
 def test_wandb_failure_does_not_break_training(cfg, tmp_path):
     class ExplodingWandb:
+        enabled = True
+
         @staticmethod
         def Image(*a, **k):
-            raise RuntimeError('wandb is down')
+            raise RuntimeError('tracker is down')
 
         @staticmethod
         def log(*a, **k):
-            raise RuntimeError('wandb is down')
+            raise RuntimeError('tracker is down')
 
     # Must not raise, and must still write the disk archive.
     generate_and_log_samples(MockModel(), cfg, None, 1, tmp_path, 'e', 0,
-                             wandb_module=ExplodingWandb())
+                             tracker=ExplodingWandb())
     assert len(list((tmp_path / 'samples' / 'e').glob('*.png'))) == 3
 
 
@@ -254,7 +256,9 @@ def test_fixed_seed_reproduces_noise_between_rounds(tmp_path):
 # --- wandb call shape (regression guards for the step-alignment fix) --------
 
 class RecordingWandb:
-    """Mock that enforces the two properties the step fix depends on."""
+    """Mock tracker that enforces the two properties the step fix depends on."""
+
+    enabled = True
 
     def __init__(self):
         self.calls = []
@@ -272,7 +276,7 @@ def test_sampling_round_makes_exactly_one_wandb_call(cfg, tmp_path):
     # Previously this cost two calls (gallery, then sample_time_sec), which
     # advanced wandb's internal step counter twice for one logical step.
     wb = RecordingWandb()
-    generate_and_log_samples(MockModel(), cfg, None, 42, tmp_path, 'r', 0, wandb_module=wb)
+    generate_and_log_samples(MockModel(), cfg, None, 42, tmp_path, 'r', 0, tracker=wb)
     assert len(wb.calls) == 1, wb.calls
     step, keys = wb.calls[0]
     assert step == 42
@@ -288,7 +292,7 @@ def test_all_prompts_failing_still_logs_timing_at_the_right_step(cfg, tmp_path):
 
     wb = RecordingWandb()
     generate_and_log_samples(MockModel(AlwaysFails()), cfg, None, 13, tmp_path, 'r', 0,
-                             wandb_module=wb)
+                             tracker=wb)
     assert len(wb.calls) == 1, wb.calls
     step, keys = wb.calls[0]
     assert step == 13
@@ -300,5 +304,5 @@ def test_log_to_wandb_false_makes_no_wandb_calls(tmp_path):
     c = build_sampling_config({'sampling': {
         'prompts': ['a'], 'steps': 2, 'cfg': 1.0, 'log_to_wandb': False}})
     wb = RecordingWandb()
-    generate_and_log_samples(MockModel(), c, None, 5, tmp_path, 'r', 0, wandb_module=wb)
+    generate_and_log_samples(MockModel(), c, None, 5, tmp_path, 'r', 0, tracker=wb)
     assert wb.calls == []

@@ -175,8 +175,26 @@ eps = 1e-8
 # weight_decay = 0.01
 
 [monitoring]
-# Set to true and fill in these fields to enable wandb
-enable_wandb = false
-wandb_api_key = ''
-wandb_tracker_name = ''
-wandb_run_name = ''
+# Which experiment tracker to use: 'wandb' | 'trackio' | 'none'.
+# TensorBoard and the on-disk sample archive are written regardless.
+# See docs/experiment_tracking.md.
+tracker = 'wandb'
+
+# --- wandb (used when tracker = 'wandb') ---
+wandb_tracker_name = 'my-project'   # project name (also used as Trackio's project)
+wandb_run_name = 'run-1'
+wandb_api_key = ''                  # empty -> falls back to $WANDB_API_KEY, then netrc.
+                                    # Never commit a real key.
+# wandb_entity = ''                 # optional team/org
+# wandb_mode = 'online'             # 'online' | 'offline' | 'disabled'. Use
+                                    # 'offline' where api.wandb.ai is unreachable,
+                                    # then `wandb sync <run_dir>`.
+# wandb_base_url = ''               # self-hosted W&B
+# wandb_offline_on_failure = true   # retry offline if online setup fails
+
+# --- Trackio (used when tracker = 'trackio') ---
+# Local-first: with none of the options below set, Trackio runs entirely on
+# this machine (no network) and you view it with `trackio show`.
+# trackio_dir = ''                  # default: <run_dir>/trackio
+# trackio_space_id = ''             # 'username/dashboard' -> free HF Space
+# trackio_server_url = ''           # 'http://host:7860'  -> your own server

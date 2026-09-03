@@ -424,7 +424,7 @@ def _annotate(image, text):
 
 
 def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
-                wandb_module=None, duration=None):
+                tracker=None, duration=None):
     """Write generated samples to wandb, TensorBoard, and disk.
 
     `results` is a list of (prompt_settings, seed, PIL image), possibly empty
@@ -443,7 +443,7 @@ def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
         except Exception as e:
             print(f'Warning: failed to save sample images to disk: {e}')
 
-    if sampling_config['log_to_wandb'] and wandb_module is not None:
+    if sampling_config['log_to_wandb'] and tracker is not None and tracker.enabled:
         try:
             # One wandb.log() call for the whole round, whether or not any
             # prompt succeeded. step= (not a 'step' dict key) is what actually
@@ -453,18 +453,21 @@ def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
             # gallery, then sample_time_sec afterward), silently pushing
             # wandb's x-axis two steps ahead of the console/TensorBoard step
             # for a single logical training step.
-            wandb_log_dict = {}
+            log_dict = {}
             if results:
-                wandb_log_dict['samples'] = [
-                    wandb_module.Image(image, caption=_caption_for(settings, seed))
-                    for settings, seed, image in results
-                ]
+                images = [tracker.Image(image, caption=_caption_for(settings, seed))
+                          for settings, seed, image in results]
+                # A backend that can't wrap images returns None; drop those
+                # rather than logging nulls.
+                images = [im for im in images if im is not None]
+                if images:
+                    log_dict['samples'] = images
             if duration is not None:
-                wandb_log_dict['samples/sample_time_sec'] = duration
-            if wandb_log_dict:
-                wandb_module.log(wandb_log_dict, step=step)
+                log_dict['samples/sample_time_sec'] = duration
+            if log_dict:
+                tracker.log(log_dict, step=step)
         except Exception as e:
-            print(f'Warning: failed to log samples to wandb: {e}')
+            print(f'Warning: failed to log samples to the tracker: {e}')
 
     if sampling_config['log_to_tensorboard'] and tb_writer is not None:
         try:
@@ -482,7 +485,7 @@ def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
 # ---------------------------------------------------------------------------
 
 def generate_and_log_samples(model, sampling_config, tb_writer, step, run_dir,
-                             label, round_index, wandb_module=None,
+                             label, round_index, tracker=None,
                              disable_block_swap=False):
     """Generate every configured prompt and log the results.
 
@@ -529,7 +532,7 @@ def generate_and_log_samples(model, sampling_config, tb_writer, step, run_dir,
     # on an all-failed round would leave that round invisible on wandb's
     # x-axis entirely rather than showing zero images with a timing point.
     log_samples(results, sampling_config, tb_writer, step, run_dir, label,
-                wandb_module=wandb_module, duration=duration)
+                tracker=tracker, duration=duration)
     print(f'Generated {len(results)}/{len(prompts)} sample(s) in {duration:.1f}s')
 
     if tb_writer is not None:
