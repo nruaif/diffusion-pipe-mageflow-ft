@@ -59,6 +59,27 @@ class Tracker:
         callers treat as 'skip the image' rather than an error."""
         return None
 
+    def log_images(self, key, entries, step=None, extra=None):
+        """Log a set of images under `key`.
+
+        `entries` is a list of (name, PIL image, caption). Backends disagree on
+        how a group of images is represented -- wandb takes a list under one
+        key and renders a gallery, while Trackio has no list-of-media branch at
+        all and silently fails to persist the batch -- so each backend decides
+        its own shape here rather than callers guessing. `extra` is a dict of
+        plain scalars logged in the same call.
+        """
+        if not self.enabled or self._failed:
+            return
+        try:
+            self._log_images(key, entries, step, extra or {})
+        except Exception as e:
+            self._disable_after_failure(e)
+
+    def _log_images(self, key, entries, step, extra):
+        if extra:
+            self._log(dict(extra), step)
+
     # -- internals -------------------------------------------------------
 
     def _disable_after_failure(self, exc):
@@ -132,6 +153,15 @@ class WandbTracker(Tracker):
         except Exception:
             return None
 
+    def _log_images(self, key, entries, step, extra):
+        # wandb renders a list under one key as a gallery.
+        payload = dict(extra)
+        images = [self.wandb.Image(img, caption=cap) for _, img, cap in entries]
+        if images:
+            payload[key] = images
+        if payload:
+            self.wandb.log(payload, step=step)
+
     def finish(self):
         if self.enabled and self.wandb is not None:
             try:
@@ -160,6 +190,22 @@ class TrackioTracker(Tracker):
         self.trackio = None
 
     def init(self, project, run_name, config, run_dir):
+        m = self.monitoring
+        space_id = m.get('trackio_space_id') or os.environ.get('TRACKIO_SPACE_ID') or None
+        server_url = m.get('trackio_server_url') or os.environ.get('TRACKIO_SERVER_URL') or None
+
+        # Keep run data beside the run's other outputs rather than in the
+        # global ~/.cache/huggingface/trackio, so a run is self-contained.
+        # trackio.init() has no dir= parameter; TRACKIO_DIR is the supported
+        # way. It MUST be set before importing trackio: the package evaluates
+        # `TRACKIO_DIR = _get_trackio_dir()` at module import, so setting it
+        # afterwards is silently ignored and everything lands in the default
+        # cache directory instead.
+        trackio_dir = m.get('trackio_dir') or (os.path.join(run_dir, 'trackio') if run_dir else None)
+        if trackio_dir:
+            os.makedirs(trackio_dir, exist_ok=True)
+            os.environ['TRACKIO_DIR'] = trackio_dir
+
         try:
             import trackio
         except ImportError:
@@ -167,17 +213,6 @@ class TrackioTracker(Tracker):
                   'installed (pip install trackio). Continuing without tracking.')
             return False
         self.trackio = trackio
-        m = self.monitoring
-
-        space_id = m.get('trackio_space_id') or os.environ.get('TRACKIO_SPACE_ID') or None
-        server_url = m.get('trackio_server_url') or os.environ.get('TRACKIO_SERVER_URL') or None
-        # Keep run data beside the run's other outputs rather than in the
-        # global ~/.cache/huggingface/trackio, so a run is self-contained.
-        # trackio.init() has no dir= parameter; TRACKIO_DIR is the supported way.
-        trackio_dir = m.get('trackio_dir') or (os.path.join(run_dir, 'trackio') if run_dir else None)
-        if trackio_dir:
-            os.makedirs(trackio_dir, exist_ok=True)
-            os.environ['TRACKIO_DIR'] = trackio_dir
 
         kwargs = {'project': project, 'name': run_name, 'config': config}
         if space_id:
@@ -205,6 +240,18 @@ class TrackioTracker(Tracker):
             return self.trackio.Image(image, caption=caption)
         except Exception:
             return None
+
+    def _log_images(self, key, entries, step, extra):
+        # Trackio's log() dispatch converts a single media object, or a list of
+        # Traces, but has no branch for a list of media -- such a payload falls
+        # through to JSON serialization and the whole batch is dropped with
+        # "Type is not JSON serializable: TrackioImage". One key per image
+        # avoids that and gives each prompt its own panel in the dashboard.
+        payload = dict(extra)
+        for name, img, cap in entries:
+            payload[f'{key}/{name}'] = self.trackio.Image(img, caption=cap)
+        if payload:
+            self.trackio.log(payload, step=step)
 
     def finish(self):
         if self.enabled and self.trackio is not None:

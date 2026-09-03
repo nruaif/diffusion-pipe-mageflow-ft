@@ -8,6 +8,7 @@ written before the `tracker` key existed.
 Run with: python3 -m pytest test/test_tracking.py -q
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -277,3 +278,92 @@ def test_trackio_missing_package_disables_without_raising(monkeypatch, tmp_path)
     t = tracking.TrackioTracker({})
     assert t.init('proj', 'run', {}, str(tmp_path)) is False
     assert t.enabled is False
+
+
+# --- media shape per backend (regression: trackio drops lists of media) ----
+
+def test_wandb_log_images_uses_a_list_under_one_key(monkeypatch, tmp_path):
+    class Rec(_FakeWandb):
+        def __init__(self):
+            super().__init__()
+            self.payload = None
+
+        def log(self, data, step=None):
+            self.payload = data
+
+    fake = Rec()
+    t = _wandb_tracker(monkeypatch, fake, {})
+    t.init('p', 'r', {}, str(tmp_path))
+    from PIL import Image as PILImage
+    img = PILImage.new('RGB', (4, 4))
+    t.log_images('samples', [('00_a', img, 'ca'), ('01_b', img, 'cb')],
+                 step=3, extra={'samples/sample_time_sec': 1.0})
+    assert isinstance(fake.payload['samples'], list)
+    assert len(fake.payload['samples']) == 2
+    assert fake.payload['samples/sample_time_sec'] == 1.0
+
+
+def test_trackio_log_images_uses_one_key_per_image(monkeypatch, tmp_path):
+    """Trackio's log() dispatch has no branch for a list of media objects, so
+    a list payload fails JSON serialization and the whole batch is silently
+    dropped. Each image must get its own key."""
+    class Rec(_FakeTrackio):
+        def __init__(self):
+            super().__init__()
+            self.payload = None
+
+        def log(self, data, step=None):
+            self.payload = data
+
+    fake = Rec()
+    monkeypatch.setitem(sys.modules, 'trackio', fake)
+    t = tracking.TrackioTracker({})
+    t.init('p', 'r', {}, str(tmp_path))
+    from PIL import Image as PILImage
+    img = PILImage.new('RGB', (4, 4))
+    t.log_images('samples', [('00_a', img, 'ca'), ('01_b', img, 'cb')],
+                 step=3, extra={'samples/sample_time_sec': 1.0})
+
+    assert 'samples' not in fake.payload, 'must not send a list of media under one key'
+    assert 'samples/00_a' in fake.payload and 'samples/01_b' in fake.payload
+    assert fake.payload['samples/sample_time_sec'] == 1.0
+    assert not any(isinstance(v, list) for v in fake.payload.values())
+
+
+def test_log_images_failure_never_raises():
+    class Boom(tracking.Tracker):
+        name = 'boom'
+
+        def __init__(self):
+            super().__init__()
+            self.enabled = True
+
+        def _log_images(self, key, entries, step, extra):
+            raise RuntimeError('down')
+
+    t = Boom()
+    t.log_images('samples', [], step=1)   # must not raise
+    assert t.enabled is False
+
+
+def test_trackio_dir_env_is_set_before_import(monkeypatch, tmp_path):
+    """trackio evaluates TRACKIO_DIR at module import, so setting it after the
+    import silently sends everything to ~/.cache/huggingface/trackio."""
+    seen = {}
+
+    class Probe(_FakeTrackio):
+        pass
+
+    real_import = __builtins__['__import__'] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def spy_import(name, *a, **k):
+        if name == 'trackio':
+            seen['dir_at_import'] = os.environ.get('TRACKIO_DIR')
+            return Probe()
+        return real_import(name, *a, **k)
+
+    import builtins
+    monkeypatch.setattr(builtins, '__import__', spy_import)
+    t = tracking.TrackioTracker({})
+    t.init('p', 'r', {}, str(tmp_path))
+    assert seen['dir_at_import'] == str(tmp_path / 'trackio')

@@ -41,7 +41,7 @@ def _find_wandb_log_calls(path):
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'log'):
+                and node.func.attr in ('log', 'log_images')):
             continue
         recv = node.func.value
         if isinstance(recv, ast.Name) and recv.id in _LOG_RECEIVERS:
@@ -68,7 +68,7 @@ def test_every_wandb_log_call_in_trainpy_has_explicit_step_kwarg():
 
 def test_every_wandb_log_call_in_validation_sampling_has_explicit_step_kwarg():
     calls = _find_wandb_log_calls(ROOT / 'utils' / 'validation_sampling.py')
-    assert calls, 'expected to find tracker.log() calls in validation_sampling.py'
+    assert calls, 'expected to find tracker.log()/log_images() calls in validation_sampling.py'
     missing = [c.lineno for c in calls
                if not any(kw.arg == 'step' for kw in c.keywords)]
     assert not missing, f'wandb_module.log() call(s) missing step= kwarg at line(s): {missing}'

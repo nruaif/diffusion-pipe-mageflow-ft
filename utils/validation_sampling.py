@@ -453,19 +453,18 @@ def log_samples(results, sampling_config, tb_writer, step, run_dir, label,
             # gallery, then sample_time_sec afterward), silently pushing
             # wandb's x-axis two steps ahead of the console/TensorBoard step
             # for a single logical training step.
-            log_dict = {}
-            if results:
-                images = [tracker.Image(image, caption=_caption_for(settings, seed))
-                          for settings, seed, image in results]
-                # A backend that can't wrap images returns None; drop those
-                # rather than logging nulls.
-                images = [im for im in images if im is not None]
-                if images:
-                    log_dict['samples'] = images
+            entries = [
+                (f"{settings['index']:02d}_{settings['label']}",
+                 image,
+                 _caption_for(settings, seed))
+                for settings, seed, image in results
+            ]
+            extra = {}
             if duration is not None:
-                log_dict['samples/sample_time_sec'] = duration
-            if log_dict:
-                tracker.log(log_dict, step=step)
+                extra['samples/sample_time_sec'] = duration
+            # The backend decides how to shape a group of images: wandb takes a
+            # list under one key (gallery), Trackio needs one key per image.
+            tracker.log_images('samples', entries, step=step, extra=extra)
         except Exception as e:
             print(f'Warning: failed to log samples to the tracker: {e}')
 

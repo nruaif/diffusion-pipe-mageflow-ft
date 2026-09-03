@@ -226,6 +226,10 @@ def test_wandb_failure_does_not_break_training(cfg, tmp_path):
         def log(*a, **k):
             raise RuntimeError('tracker is down')
 
+        @staticmethod
+        def log_images(*a, **k):
+            raise RuntimeError('tracker is down')
+
     # Must not raise, and must still write the disk archive.
     generate_and_log_samples(MockModel(), cfg, None, 1, tmp_path, 'e', 0,
                              tracker=ExplodingWandb())
@@ -256,7 +260,10 @@ def test_fixed_seed_reproduces_noise_between_rounds(tmp_path):
 # --- wandb call shape (regression guards for the step-alignment fix) --------
 
 class RecordingWandb:
-    """Mock tracker that enforces the two properties the step fix depends on."""
+    """Mock tracker that enforces the two properties the step fix depends on.
+
+    Mirrors the wandb backend's shape: a list of images under one key.
+    """
 
     enabled = True
 
@@ -264,9 +271,16 @@ class RecordingWandb:
         self.calls = []
 
     def log(self, data, step=None):
-        assert step is not None, 'wandb.log() called without step='
+        assert step is not None, 'log() called without step='
         assert 'step' not in data, "'step' passed as a dict key instead of step="
         self.calls.append((step, sorted(data.keys())))
+
+    def log_images(self, key, entries, step=None, extra=None):
+        payload = dict(extra or {})
+        if entries:
+            payload[key] = [self.Image(img, caption=cap) for _, img, cap in entries]
+        if payload:
+            self.log(payload, step=step)
 
     def Image(self, *a, **k):
         return ('Image', a, k)
